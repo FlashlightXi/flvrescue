@@ -9,18 +9,20 @@ py -m pip install -e ".[test]"
 py -m pytest
 ```
 
-The tests use an injectable Reader that raises `OSError` whenever a requested read intersects a configured bad range. This tests actual error handling rather than merely changing readable file bytes.
+The tests use injectable Readers that either raise `OSError` or delay reads intersecting configured ranges. This tests error and slow-read strategy changes rather than merely changing readable file bytes.
 
 Coverage includes:
 
 - Normal byte-for-byte copy and hash equality
 - A short final normal block
-- The default 8 MiB -> 64 KiB -> 4 KiB hierarchy
-- 4 KiB and 64 KiB aligned unreadable ranges
-- Multiple, adjacent, merged, and block-boundary ranges
-- Zero-filling only the final unreadable units
-- Recovery of readable data after damaged ranges
-- Ctrl+C checkpointing and forward-only resume
+- Fast Pass continuation over normal ranges without fallback reads
+- Slow detection, adaptive skip growth, and normal-region rediscovery
+- Pass 2 reads limited to ranges skipped by Pass 1
+- Optional Pass 3 localization through block, fallback, and sector sizes
+- Range splitting, merging, and zero-filling of final unreadable units
+- Ctrl+C checkpointing and resume without rereading recovered ranges
+- Safe migration of v1 prefix maps to the v2 range map
+- Progress updates while a simulated source read is blocked
 - Malformed or mismatched maps and unsafe path aliases
 - Generated FLV fixtures and FFmpeg decode checks
 

@@ -1,14 +1,15 @@
-"""Forward-only, fault-tolerant file rescue engine."""
+"""Range-based, multi-pass rescue engine."""
 
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
 from os import PathLike
 from pathlib import Path
 from typing import Callable, Protocol
 
-from .mapfile import BadRange, MapValidationError, RescueMap, load_map, save_map_atomic
+from .mapfile import MapValidationError, RecoveryRange, RescueMap, load_map, save_map_atomic
 from .progress import ProgressReporter
 from .reader import FileReader, Reader
 
@@ -17,17 +18,20 @@ DEFAULT_BLOCK_SIZE = 8 * 1024 * 1024
 DEFAULT_FALLBACK_SIZE = 64 * 1024
 DEFAULT_SECTOR_SIZE = 4 * 1024
 DEFAULT_CHECKPOINT_INTERVAL = 64 * 1024 * 1024
+DEFAULT_SLOW_THRESHOLD = 2.0
+DEFAULT_SKIP_START = 8 * 1024 * 1024
+DEFAULT_SKIP_MAX = 1024 * 1024 * 1024
+DEFAULT_MAX_PASS = 2
 
 
 class ProgressSink(Protocol):
-    def update(
-        self,
-        processed: int,
-        *,
-        unreadable: int = 0,
-        bad_ranges: int = 0,
-        force: bool = False,
-    ) -> object: ...
+    def update(self, **values: object) -> object: ...
+
+    def begin_read(self, offset: int, size: int, *, status: str = "reading") -> object: ...
+
+    def end_read(self, *, status: str) -> object: ...
+
+    def event(self, kind: str, message: str) -> object: ...
 
     def close(self) -> object: ...
 
@@ -38,16 +42,48 @@ class RescueResult:
     destination: Path
     map_path: Path
     source_size: int
-    completed_until: int
-    bad_ranges: tuple[BadRange, ...]
-
-    @property
-    def unreadable_bytes(self) -> int:
-        return sum(item.length for item in self.bad_ranges)
+    current_pass: int
+    ranges: tuple[RecoveryRange, ...]
 
     @property
     def recovered_bytes(self) -> int:
-        return self.completed_until - self.unreadable_bytes
+        return sum(item.length for item in self.ranges if item.status == "recovered")
+
+    @property
+    def skipped_bytes(self) -> int:
+        return sum(item.length for item in self.ranges if item.status == "skipped")
+
+    @property
+    def unreadable_bytes(self) -> int:
+        return sum(item.length for item in self.ranges if item.status == "unreadable")
+
+    @property
+    def unprocessed_bytes(self) -> int:
+        return sum(item.length for item in self.ranges if item.status == "unprocessed")
+
+    @property
+    def bad_ranges(self) -> tuple[RecoveryRange, ...]:
+        return tuple(item for item in self.ranges if item.status == "unreadable")
+
+    @property
+    def completed_until(self) -> int:
+        frontier = 0
+        for item in self.ranges:
+            if item.status == "unprocessed":
+                break
+            frontier = item.end
+        return frontier
+
+
+@dataclass(frozen=True)
+class ReadOutcome:
+    data: bytes | None
+    elapsed: float
+    failure: str | None
+
+    @property
+    def succeeded(self) -> bool:
+        return self.data is not None
 
 
 ReaderFactory = Callable[[Path], Reader]
@@ -79,30 +115,7 @@ def _validate_sizes(block_size: int, fallback_size: int, sector_size: int) -> No
         raise ValueError("block_size >= fallback_size >= sector_size is required")
 
 
-def _read_exact(reader: Reader, offset: int, size: int) -> bytes | None:
-    """Read once; return ``None`` for an I/O error or a short read.
-
-    A short read below the known source size is handled exactly as a failed
-    read.  It is important not to silently write shifted/truncated data.
-    """
-
-    try:
-        data = reader.read_at(offset, size)
-    except OSError:
-        return None
-    if not isinstance(data, (bytes, bytearray, memoryview)):
-        raise TypeError("Reader.read_at() must return bytes-like data")
-    if len(data) != size:
-        return None
-    return bytes(data)
-
-
 def _write_at(handle: object, offset: int, data: bytes) -> None:
-    """Write all bytes at an explicit logical output offset."""
-
-    # Binary file handles return the number of bytes written, although a short
-    # write is rare for regular files.  Handle it instead of advancing the
-    # resume point past data that was never handed to the operating system.
     handle.seek(offset)  # type: ignore[attr-defined]
     view = memoryview(data)
     while view:
@@ -138,7 +151,6 @@ def _load_or_create_state(
             ),
             False,
         )
-
     state = load_map(map_path)
     if state.source_path != str(source):
         raise MapValidationError("map source_path does not match the requested source")
@@ -151,15 +163,15 @@ def _load_or_create_state(
 
 def _make_progress(
     progress: ProgressSink | bool | None,
-    source: Path,
     source_size: int,
 ) -> ProgressSink | None:
     if progress is True:
-        return ProgressReporter(source, source_size)
+        return ProgressReporter(source_size)
     if progress is False or progress is None:
         return None
-    if not hasattr(progress, "update"):
-        raise TypeError("progress must be None, bool, or an object with update()")
+    required = ("update", "begin_read", "end_read", "event")
+    if not all(hasattr(progress, name) for name in required):
+        raise TypeError("custom progress objects must implement update/read/event methods")
     return progress
 
 
@@ -174,147 +186,351 @@ def rescue(
     fallback_size: int = DEFAULT_FALLBACK_SIZE,
     sector_size: int = DEFAULT_SECTOR_SIZE,
     checkpoint_interval: int = DEFAULT_CHECKPOINT_INTERVAL,
+    slow_threshold: float = DEFAULT_SLOW_THRESHOLD,
+    skip_start: int = DEFAULT_SKIP_START,
+    skip_max: int = DEFAULT_SKIP_MAX,
+    max_pass: int = DEFAULT_MAX_PASS,
+    clock: Callable[[], float] = time.monotonic,
 ) -> RescueResult:
-    """Rescue one file with a single forward-only read pass.
-
-    The source is only opened read-only.  For a normal block, exactly one read
-    is attempted; a failed normal read is localized with one pass of fallback
-    reads and then one pass of sector reads.  Failed sector reads are zero-filled.
-
-    ``KeyboardInterrupt`` is intentionally re-raised *after* the destination
-    and map have been flushed.  The CLI converts that interruption into a calm,
-    traceback-free completion message; library callers retain normal Python
-    cancellation semantics.
-    """
+    """Recover easy ranges first, then refine skipped and unreadable ranges."""
 
     _validate_sizes(block_size, fallback_size, sector_size)
-    if isinstance(checkpoint_interval, bool) or not isinstance(checkpoint_interval, int):
-        raise ValueError("checkpoint_interval must be a positive integer")
-    if checkpoint_interval <= 0:
-        raise ValueError("checkpoint_interval must be a positive integer")
+    for name, value in {
+        "checkpoint_interval": checkpoint_interval,
+        "skip_start": skip_start,
+        "skip_max": skip_max,
+    }.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    if skip_start > skip_max:
+        raise ValueError("skip_start must not exceed skip_max")
+    if isinstance(slow_threshold, bool) or not isinstance(slow_threshold, (int, float)):
+        raise ValueError("slow_threshold must be a positive number")
+    if slow_threshold <= 0:
+        raise ValueError("slow_threshold must be a positive number")
+    if isinstance(max_pass, bool) or not isinstance(max_pass, int) or max_pass not in (1, 2, 3):
+        raise ValueError("max_pass must be 1, 2, or 3")
 
     source_path = _canonical_path(source)
     destination_path = _canonical_path(destination)
     if _same_path(source_path, destination_path):
         raise ValueError("source and destination must be different files")
-    resolved_map_path = _canonical_path(map_path) if map_path is not None else _default_map_path(destination_path)
-    # A sidecar is written with os.replace.  It must never alias either data
-    # file (including through an existing hard link), or a checkpoint could
-    # replace that file with JSON.
+    resolved_map_path = (
+        _canonical_path(map_path) if map_path is not None else _default_map_path(destination_path)
+    )
     if _same_path(resolved_map_path, source_path):
         raise ValueError("map_path must be different from the source file")
     if _same_path(resolved_map_path, destination_path):
         raise ValueError("map_path must be different from the destination file")
     source_size = source_path.stat().st_size
-
     state, resuming = _load_or_create_state(
         resolved_map_path, source_path, source_size, destination_path
     )
+
     if resuming:
         if not destination_path.is_file():
             raise FileNotFoundError("destination from resume map does not exist")
         destination_size = destination_path.stat().st_size
-        if destination_size < state.completed_until or destination_size > source_size:
+        required_end = max(
+            (item.end for item in state.ranges if item.status == "recovered"),
+            default=0,
+        )
+        if destination_size < required_end or destination_size > source_size:
             raise MapValidationError(
-                "destination size is incompatible with the resume map and source_size"
+                "destination size is incompatible with committed recovered ranges"
             )
         destination_handle = destination_path.open("r+b")
+        if destination_size < source_size:
+            destination_handle.truncate(source_size)
+            _flush_destination(destination_handle)
     else:
         if destination_path.exists():
             raise FileExistsError(
                 "destination already exists without a matching rescue map; refusing to overwrite it"
-        )
+            )
         destination_handle = destination_path.open("x+b")
-        # Create and durably publish an empty destination before its first map.
-        # While interrupted output is only a verified contiguous prefix, the
-        # completed final output reaches ``source_size`` through explicit writes.
+        destination_handle.truncate(source_size)
         _flush_destination(destination_handle)
         save_map_atomic(resolved_map_path, state)
 
-    reporter = _make_progress(progress, source_path, source_size)
+    reporter = _make_progress(progress, source_size)
     factory = reader_factory or FileReader
     reader: Reader | None = None
-    frontier = state.completed_until
+    dirty_bytes = 0
 
     def checkpoint() -> None:
-        """Make the contiguous prefix durable before advertising it in the map."""
-
-        nonlocal state
-        if frontier < state.completed_until:
-            raise RuntimeError("rescue progress moved backwards")
+        nonlocal dirty_bytes
         _flush_destination(destination_handle)
-        state.completed_until = frontier
         save_map_atomic(resolved_map_path, state)
+        dirty_bytes = 0
 
-    def report(*, force: bool = False) -> None:
+    def event(kind: str, message: str) -> None:
+        if reporter is not None:
+            reporter.event(kind, message)
+
+    def report(status: str, *, force: bool = False) -> None:
         if reporter is not None:
             reporter.update(
-                frontier,
+                current_pass=min(state.current_pass, 3),
+                pass_cursor=state.pass_cursor,
+                recovered=state.recovered_bytes,
+                skipped=state.skipped_bytes,
+                slow=state.slow_bytes,
                 unreadable=state.unreadable_bytes,
-                bad_ranges=len(state.bad_ranges),
+                status=status,
                 force=force,
             )
 
-    def write_contiguous(offset: int, data: bytes) -> None:
-        nonlocal frontier
-        if offset != frontier:
-            raise RuntimeError("rescue attempted a non-contiguous output write")
+    def read_once(offset: int, length: int, *, status: str) -> ReadOutcome:
+        if reporter is not None:
+            reporter.begin_read(offset, length, status=status)
+        started = clock()
+        try:
+            try:
+                raw = reader.read_at(offset, length)  # type: ignore[union-attr]
+            except OSError:
+                elapsed = max(0.0, clock() - started)
+                if reporter is not None:
+                    reporter.end_read(status="error")
+                return ReadOutcome(None, elapsed, "read error")
+            if not isinstance(raw, (bytes, bytearray, memoryview)):
+                raise TypeError("Reader.read_at() must return bytes-like data")
+            elapsed = max(0.0, clock() - started)
+            if len(raw) != length:
+                if reporter is not None:
+                    reporter.end_read(status="error")
+                return ReadOutcome(None, elapsed, "short read")
+            data = bytes(raw)
+            if reporter is not None:
+                reporter.end_read(status="slow" if elapsed >= slow_threshold else "normal")
+            return ReadOutcome(data, elapsed, None)
+        except BaseException:
+            if reporter is not None:
+                reporter.end_read(status="error")
+            raise
+
+    def write_recovered(offset: int, data: bytes, *, slow: bool) -> None:
+        nonlocal dirty_bytes
         _write_at(destination_handle, offset, data)
-        frontier += len(data)
+        state.replace_range(offset, len(data), "recovered", "slow" if slow else None)
+        dirty_bytes += len(data)
+
+    def zero_unreadable(offset: int, length: int) -> None:
+        nonlocal dirty_bytes
+        _write_at(destination_handle, offset, b"\0" * length)
+        state.replace_range(offset, length, "unreadable", "read_error")
+        dirty_bytes += length
+
+    def maybe_checkpoint(*, force: bool = False) -> None:
+        if force or dirty_bytes >= checkpoint_interval:
+            checkpoint()
+
+    def apply_adaptive_skip(cause: str) -> bool:
+        current = state.range_at(state.pass_cursor)
+        if current is None or current.status != "unprocessed":
+            return False
+        width = state.adaptive_skip or skip_start
+        length = min(width, current.end - state.pass_cursor)
+        offset = state.pass_cursor
+        state.replace_range(offset, length, "skipped", cause)
+        state.pass_cursor += length
+        state.adaptive_skip = min(skip_max, max(skip_start, width * 2))
+        event("skip", f"Skip {length} bytes at offset {offset}; next width {state.adaptive_skip}")
+        return True
+
+    def run_pass1() -> None:
+        state.pass_cursor = min(state.pass_cursor, source_size)
+        report("normal", force=True)
+        while state.pass_cursor < source_size:
+            item = state.range_at(state.pass_cursor)
+            if item is None:
+                break
+            if item.status != "unprocessed":
+                state.pass_cursor = item.end
+                continue
+            offset = state.pass_cursor
+            length = min(block_size, item.end - offset)
+            outcome = read_once(offset, length, status="reading")
+            slow = outcome.succeeded and outcome.elapsed >= slow_threshold
+            if outcome.data is not None:
+                write_recovered(offset, outcome.data, slow=slow)
+                state.pass_cursor += length
+                if slow:
+                    event("slow", f"Slow read at offset {offset}: {outcome.elapsed:.2f}s")
+                    state.adaptive_skip = state.adaptive_skip or skip_start
+                    apply_adaptive_skip("slow")
+                    maybe_checkpoint(force=True)
+                    report("skip")
+                    continue
+                if state.adaptive_skip:
+                    event("normal", f"Normal read speed rediscovered at offset {offset}")
+                    state.adaptive_skip = 0
+            else:
+                zero_unreadable(offset, length)
+                state.pass_cursor += length
+                event("error", f"Block read failure at offset {offset}: {outcome.failure}")
+                state.adaptive_skip = state.adaptive_skip or skip_start
+                apply_adaptive_skip("read_error")
+                maybe_checkpoint(force=True)
+                report("skip")
+                continue
+            maybe_checkpoint()
+            report("normal")
+        state.current_pass = 2
+        state.pass_cursor = 0
+        state.adaptive_skip = 0
+        checkpoint()
+        event("normal", "Pass 1 complete; switching to Pass 2")
+        report("normal", force=True)
+
+    def apply_pass2_jump() -> bool:
+        current = state.range_at(state.pass_cursor)
+        if current is None or current.status != "skipped":
+            return False
+        width = state.adaptive_skip or skip_start
+        length = min(width, current.end - state.pass_cursor)
+        offset = state.pass_cursor
+        state.pass_cursor += length
+        state.adaptive_skip = min(skip_max, max(skip_start, width * 2))
+        event("skip", f"Pass 2 probe jump {length} bytes from offset {offset}")
+        return True
+
+    def run_pass2() -> None:
+        report("normal", force=True)
+        while state.pass_cursor < source_size:
+            item = state.range_at(state.pass_cursor)
+            if item is None:
+                break
+            if item.status != "skipped":
+                state.pass_cursor = item.end
+                continue
+            offset = state.pass_cursor
+            length = min(fallback_size, item.end - offset)
+            outcome = read_once(offset, length, status="reading")
+            slow = outcome.succeeded and outcome.elapsed >= slow_threshold
+            if outcome.data is not None:
+                write_recovered(offset, outcome.data, slow=slow)
+                state.pass_cursor += length
+                if slow:
+                    event("slow", f"Slow Pass 2 probe at offset {offset}: {outcome.elapsed:.2f}s")
+                    state.adaptive_skip = state.adaptive_skip or skip_start
+                    apply_pass2_jump()
+                    maybe_checkpoint(force=True)
+                    report("skip")
+                    continue
+                if state.adaptive_skip:
+                    event("normal", f"Normal region rediscovered in Pass 2 at offset {offset}")
+                    state.adaptive_skip = 0
+            else:
+                zero_unreadable(offset, length)
+                state.pass_cursor += length
+                event("error", f"Pass 2 probe failure at offset {offset}: {outcome.failure}")
+                state.adaptive_skip = state.adaptive_skip or skip_start
+                apply_pass2_jump()
+                maybe_checkpoint(force=True)
+                report("skip")
+                continue
+            maybe_checkpoint()
+            report("normal")
+        state.current_pass = 3
+        state.pass_cursor = 0
+        state.adaptive_skip = 0
+        checkpoint()
+        event("normal", "Pass 2 complete; Deep recovery remains optional")
+        report("normal", force=True)
+
+    def recover_sectors(offset: int, length: int) -> None:
+        cursor = offset
+        end = offset + length
+        while cursor < end:
+            size = min(sector_size, end - cursor)
+            outcome = read_once(cursor, size, status="reading")
+            if outcome.data is None:
+                zero_unreadable(cursor, size)
+            else:
+                write_recovered(
+                    cursor,
+                    outcome.data,
+                    slow=outcome.elapsed >= slow_threshold,
+                )
+            cursor += size
+
+    def recover_fallback_piece(offset: int, length: int) -> None:
+        outcome = read_once(offset, length, status="reading")
+        if outcome.data is not None:
+            write_recovered(offset, outcome.data, slow=outcome.elapsed >= slow_threshold)
+        elif length <= sector_size:
+            zero_unreadable(offset, length)
+        else:
+            recover_sectors(offset, length)
+
+    def recover_deep_block(offset: int, length: int) -> bool:
+        outcome = read_once(offset, length, status="reading")
+        if outcome.data is not None:
+            write_recovered(offset, outcome.data, slow=outcome.elapsed >= slow_threshold)
+            return False
+        event("error", f"Deep block read failure at offset {offset}; localizing")
+        if length <= sector_size:
+            zero_unreadable(offset, length)
+        elif length <= fallback_size:
+            recover_sectors(offset, length)
+        else:
+            cursor = offset
+            end = offset + length
+            while cursor < end:
+                size = min(fallback_size, end - cursor)
+                recover_fallback_piece(cursor, size)
+                cursor += size
+        return True
+
+    def run_pass3() -> None:
+        report("normal", force=True)
+        while state.pass_cursor < source_size:
+            item = state.range_at(state.pass_cursor)
+            if item is None:
+                break
+            if item.status not in ("skipped", "unreadable"):
+                state.pass_cursor = item.end
+                continue
+            offset = state.pass_cursor
+            length = min(block_size, item.end - offset)
+            localized = recover_deep_block(offset, length)
+            state.pass_cursor += length
+            maybe_checkpoint(force=localized)
+            report("error" if localized else "normal")
+        state.current_pass = 4
+        state.pass_cursor = source_size
+        state.adaptive_skip = 0
+        checkpoint()
+        event("complete", "Pass 3 complete")
+        report("complete", force=True)
 
     try:
         reader = factory(source_path)
-        report(force=True)
-        while frontier < source_size:
-            offset = frontier
-            length = min(block_size, source_size - offset)
-            normal_data = _read_exact(reader, offset, length)
-            used_fallback = normal_data is None
-            if normal_data is not None:
-                write_contiguous(offset, normal_data)
+        report("starting", force=True)
+        while state.current_pass <= max_pass:
+            if state.current_pass == 1:
+                run_pass1()
+            elif state.current_pass == 2:
+                run_pass2()
+            elif state.current_pass == 3:
+                run_pass3()
             else:
-                fallback_end = offset + length
-                fallback_offset = offset
-                while fallback_offset < fallback_end:
-                    fallback_length = min(fallback_size, fallback_end - fallback_offset)
-                    fallback_data = _read_exact(reader, fallback_offset, fallback_length)
-                    if fallback_data is not None:
-                        write_contiguous(fallback_offset, fallback_data)
-                    else:
-                        sector_end = fallback_offset + fallback_length
-                        sector_offset = fallback_offset
-                        while sector_offset < sector_end:
-                            sector_length = min(sector_size, sector_end - sector_offset)
-                            sector_data = _read_exact(reader, sector_offset, sector_length)
-                            if sector_data is None:
-                                write_contiguous(sector_offset, b"\x00" * sector_length)
-                                state.add_bad_range(sector_offset, sector_length)
-                            else:
-                                write_contiguous(sector_offset, sector_data)
-                            sector_offset += sector_length
-                    fallback_offset += fallback_length
-
-            # Fallback can have created new bad ranges, so record it promptly;
-            # normal blocks are checkpointed at the lower-frequency interval.
-            if used_fallback or frontier - state.completed_until >= checkpoint_interval:
-                checkpoint()
-            report()
-
+                break
         checkpoint()
-        report(force=True)
+        report("complete" if state.current_pass == 4 else "normal", force=True)
         return RescueResult(
             source=source_path,
             destination=destination_path,
             map_path=resolved_map_path,
             source_size=source_size,
-            completed_until=state.completed_until,
-            bad_ranges=tuple(state.bad_ranges),
+            current_pass=state.current_pass,
+            ranges=tuple(state.ranges),
         )
     except KeyboardInterrupt:
-        # ``frontier`` only advances after a complete explicit-offset write.
-        # Commit that contiguous prefix so the next invocation need not reread it.
         checkpoint()
-        report(force=True)
+        event("error", "Interrupted; destination and map checkpointed")
+        report("error", force=True)
         raise
     finally:
         if reader is not None:

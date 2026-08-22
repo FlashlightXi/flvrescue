@@ -2,7 +2,7 @@
 
 `flvrescue` is a fault-tolerant file recovery tool optimized for large FLV recordings on failing drives.
 
-It copies readable data in one forward pass, zero-fills unreadable regions, and preserves the source file's offsets and final size. The recovery algorithm is format-neutral, while the workflow is designed around large recordings that will later be inspected or processed with FFmpeg.
+It recovers fast, readable ranges before revisiting slow or failed regions. The destination preserves the source file's offsets and final size, while a range map supports safe multi-pass resume.
 
 > [!WARNING]
 > Reading a failing drive can make its condition worse. If the data is irreplaceable, stop and consider a professional recovery service first. `flvrescue` does not repair drives, filesystems, or unreadable sectors.
@@ -18,16 +18,17 @@ flvrescue damaged.flv rescued.flv
 
 The source is opened read-only. By default, resume state is saved beside the output as `rescued.flv.rescue.json`.
 
-If the operation is interrupted, run the same command again. The saved map is validated before recovery continues, and the completed prefix is not read again.
+If the operation is interrupted, run the same command again. The saved map is validated before recovery continues, and committed recovered ranges are not read again.
 
 ## Main features
 
-- Sequential, forward-only recovery with no parallel reads
-- 8 MiB reads, localized to 64 KiB and then 4 KiB after errors
-- Zero-fill for unreadable final ranges while preserving logical offsets
-- Atomic JSON resume map with merged bad-range records
+- Fast Pass with timed reads, probes, and adaptive skipping
+- Pass 2 recovery limited to ranges skipped by the Fast Pass
+- Optional Pass 3 localization from 8 MiB to 64 KiB and 4 KiB
+- One source read at a time; no parallel reads against the failing disk
+- Range-based atomic JSON map with v1 map migration
 - Ctrl+C checkpointing and resumable partial output
-- Progress reporting for speed, recovered bytes, unreadable bytes, and elapsed time
+- Threaded ANSI Live progress that continues while a source read is blocked
 - Injectable Reader API for deterministic I/O-error testing
 
 ## Common commands
@@ -39,6 +40,13 @@ flvrescue damaged.flv rescued.flv --map rescued.map.json
 # Explicitly select the recovery hierarchy
 flvrescue damaged.flv rescued.flv --block 8M --fallback 64K --sector 4K
 
+# Stop after the fastest pass, or opt into deep recovery
+flvrescue damaged.flv rescued.flv --max-pass 1
+flvrescue damaged.flv rescued.flv --max-pass 3
+
+# Tune slow detection and adaptive skipping
+flvrescue damaged.flv rescued.flv --slow-threshold 2 --skip-start 8M --skip-max 1G
+
 # Disable periodic progress output
 flvrescue damaged.flv rescued.flv --no-progress
 ```
@@ -46,10 +54,10 @@ flvrescue damaged.flv rescued.flv --no-progress
 The default recovery flow is:
 
 ```text
-8 MiB read succeeds  -> write it
-8 MiB read fails     -> read that range in 64 KiB pieces
-64 KiB read fails    -> read that piece in 4 KiB pieces
-4 KiB read fails     -> write zeroes and record the bad range
+Pass 1: fast read succeeds -> write it
+        slow/error         -> preserve any data, skip ahead, and probe
+Pass 2: revisit skipped ranges with smaller probes
+Pass 3: optional 8 MiB -> 64 KiB -> 4 KiB deep localization
 ```
 
 ## Documentation
@@ -65,7 +73,7 @@ py -m pip install -e ".[test]"
 py -m pytest
 ```
 
-`flvrescue` is currently Windows-focused and intentionally limited to ordinary files. It does not perform raw-device cloning, filesystem repair, automatic bad-region retry passes, SMART operations, or concurrent reads.
+`flvrescue` is currently Windows-focused and intentionally limited to ordinary files. It does not perform raw-device cloning, filesystem repair, SMART operations, forced read cancellation, or concurrent source reads.
 
 ## License
 

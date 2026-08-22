@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
+import time
 
 
 @dataclass(frozen=True)
@@ -56,3 +57,24 @@ class FaultInjectingReader:
     def __exit__(self, *_: object) -> None:
         self.close()
 
+
+class SlowInjectingReader(FaultInjectingReader):
+    """Reader double that delays reads intersecting selected ranges."""
+
+    def __init__(
+        self,
+        data: bytes,
+        slow_ranges: Iterable[tuple[int, int]],
+        *,
+        delay: float = 0.02,
+        bad_ranges: Iterable[tuple[int, int]] = (),
+    ) -> None:
+        super().__init__(data, bad_ranges)
+        self.slow_ranges = tuple(ByteRange(offset, length) for offset, length in slow_ranges)
+        self.delay = delay
+
+    def read_at(self, offset: int, size: int) -> bytes:
+        end = offset + size
+        if any(offset < item.end and item.offset < end for item in self.slow_ranges):
+            time.sleep(self.delay)
+        return super().read_at(offset, size)

@@ -28,7 +28,7 @@ After Ctrl+C, a crash, or another interruption, repeat the same command:
 flvrescue damaged.flv rescued.flv
 ```
 
-Before resuming, `flvrescue` verifies the source path and size, destination path, completed offset, and bad ranges. It resumes at `completed_until` without rereading the committed prefix.
+Before resuming, `flvrescue` verifies the source path and size, destination path, pass cursor, and complete range map. It schedules only ranges that remain eligible for the current pass. Existing v1 maps are migrated when they are next checkpointed.
 
 Do not edit the JSON map manually. A malformed or mismatched map is rejected. The map path must not refer to the source or destination, including through an existing hard link.
 
@@ -40,6 +40,10 @@ Do not edit the JSON map manually. A malformed or mismatched map is rejected. Th
 | `--block SIZE` | `8M` | Normal read size |
 | `--fallback SIZE` | `64K` | Read size after a normal-block error |
 | `--sector SIZE` | `4K` | Final read and zero-fill unit |
+| `--slow-threshold SECONDS` | `2.0` | Successful read duration treated as slow |
+| `--skip-start SIZE` | `8M` | Initial adaptive skip width |
+| `--skip-max SIZE` | `1G` | Maximum adaptive skip width |
+| `--max-pass {1,2,3}` | `2` | Last pass to execute; Pass 3 is optional deep recovery |
 | `--no-progress` | off | Suppress periodic progress output |
 
 Sizes accept byte counts or `K`, `M`, and `G` suffixes. The values must satisfy:
@@ -56,20 +60,24 @@ flvrescue damaged.flv rescued.flv --map rescued.map.json
 flvrescue damaged.flv rescued.flv `
   --block 8M `
   --fallback 64K `
-  --sector 4K
+  --sector 4K `
+  --slow-threshold 2 `
+  --max-pass 2
 ```
 
 Run `flvrescue --help` for the installed version's complete CLI syntax.
 
 ## Progress and summary
 
-Progress is printed at a low frequency so display updates do not add source-drive I/O:
+On a TTY, a dedicated renderer keeps a compact three-line Live display at the bottom of the terminal. Important slow, error, skip, rediscovery, and pass-change events remain visible above it. Rendering reads shared memory only and never touches the source drive.
 
 ```text
-File: damaged.flv | 78.4 GiB / 100.0 GiB ( 78.4%) | Speed: 112.8 MiB/s (avg 108.2 MiB/s) | Elapsed: 12:21 | Recovered: 78.4 GiB | Unreadable: 16.0 KiB | Bad ranges: 3
+Pass 1 Fast rescue | Elapsed 12:21 | Progress 78.4% | reading
+Speed 112.8 MiB/s | Recovered 78.4 GiB | Slow/Skipped 64.0 MiB | Unreadable 8.0 MiB
+Read: offset 84288733184 + 8.0 MiB | waiting 0.4s
 ```
 
-The final summary reports recovered bytes, unreadable bytes, merged bad-range count, output path, and map path.
+Non-TTY streams receive ordinary line-based logs. The final summary reports recovered, skipped, unreadable, and unprocessed bytes, plus the next available pass and map path.
 
 ## Library API
 
@@ -93,25 +101,29 @@ def read_at(offset: int, size: int) -> bytes:
     ...
 ```
 
-This is used by the test suite to raise controlled `OSError` instances without touching a damaged drive. `block_size`, `fallback_size`, `sector_size`, `checkpoint_interval`, and a custom progress sink can also be supplied.
+This is used by the test suite to raise controlled `OSError` instances or delay selected reads without touching a damaged drive. Pass limits, slow threshold, skip bounds, read sizes, checkpoint interval, and a custom progress sink can also be supplied.
 
 Library calls checkpoint and then re-raise `KeyboardInterrupt`. The CLI catches that interruption, prints a resume message, and exits without a traceback.
 
 ## Resume-map format
 
-The compact v1 JSON map stores:
+The v2 JSON map stores the active pass, its cursor, adaptive skip state, and a complete set of non-overlapping ranges:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "source_path": "damaged.flv",
   "source_size": 107374182400,
   "destination_path": "rescued.flv",
-  "completed_until": 84288733184,
-  "bad_ranges": [
-    {"offset": 52428800, "length": 4096}
+  "current_pass": 2,
+  "pass_cursor": 52428800,
+  "adaptive_skip": 8388608,
+  "ranges": [
+    {"offset": 0, "length": 52428800, "status": "recovered"},
+    {"offset": 52428800, "length": 8388608, "status": "skipped", "cause": "slow"},
+    {"offset": 60817408, "length": 107313364992, "status": "unprocessed"}
   ]
 }
 ```
 
-Paths are stored canonically. Adjacent and overlapping bad ranges are merged.
+Statuses are `recovered`, `skipped`, `unreadable`, and `unprocessed`. Adjacent ranges with identical status and cause are merged. Paths are stored canonically.
