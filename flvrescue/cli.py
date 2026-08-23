@@ -165,10 +165,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-pass",
         type=int,
         choices=(1, 2, 3, 4),
-        default=DEFAULT_MAX_PASS,
+        default=None,
         help=(
             "last pass to run: 1 fast scan, 2 likely-good fill, "
             "3 slow/error retry, 4 deep recovery (default: 2)"
+        ),
+    )
+    parser.add_argument(
+        "--through",
+        choices=("scan", "fill", "retry", "deep"),
+        help=(
+            "how far to go: scan=pass 1, fill=pass 2 (blue survey only), "
+            "retry=pass 3, deep=pass 4. fill does not start pass 3"
         ),
     )
     return parser
@@ -310,6 +318,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--slow-threshold must be greater than zero")
     if args.skip_start > args.skip_max:
         parser.error("--skip-start must not exceed --skip-max")
+    if args.through is not None and args.max_pass is not None:
+        parser.error("use either --through or --max-pass, not both")
+    max_pass = {
+        "scan": 1,
+        "fill": 2,
+        "retry": 3,
+        "deep": 4,
+    }.get(args.through or "", args.max_pass if args.max_pass is not None else DEFAULT_MAX_PASS)
     try:
         result = rescue(
             args.source,
@@ -325,7 +341,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             skip_max=args.skip_max,
             skip_reset_after=args.skip_reset_after,
             survey_stride=args.survey_stride,
-            max_pass=args.max_pass,
+            max_pass=max_pass,
         )
     except KeyboardInterrupt:
         print("\nInterrupted. Output and resume map were checkpointed.", file=sys.stderr)

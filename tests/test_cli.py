@@ -59,6 +59,13 @@ def test_parser_exposes_survey_and_skip_growth_options() -> None:
     assert args.max_pass == 1
 
 
+def test_through_fill_means_pass2_only() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["src.flv", "dst.flv", "--through", "fill"])
+    assert args.through == "fill"
+    assert args.max_pass is None
+
+
 def test_parse_positive_int_rejects_zero() -> None:
     with pytest.raises(argparse.ArgumentTypeError):
         parse_positive_int("0")

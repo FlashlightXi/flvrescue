@@ -484,3 +484,35 @@ def test_resume_reruns_pass2_when_survey_gaps_remain(tmp_path: Path) -> None:
     assert reader.calls
     assert result.easy_skipped_bytes == 0
     assert result.current_pass == 3
+
+
+def test_max_pass3_fills_remaining_survey_before_slow_retry(tmp_path: Path) -> None:
+    source = tmp_path / "source.flv"
+    destination = tmp_path / "rescued.flv"
+    map_path = tmp_path / "rescued.map.json"
+    payload = patterned_bytes(256)
+    source.write_bytes(payload)
+    run_rescue(
+        source,
+        destination,
+        map_path=map_path,
+        reader=FaultInjectingReader(payload),
+        max_pass=1,
+        survey_stride=64,
+    )
+    map_data = read_map(map_path)
+    map_data["current_pass"] = 3
+    map_path.write_text(json.dumps(map_data), encoding="utf-8")
+
+    reader = FaultInjectingReader(payload)
+    result = run_rescue(
+        source,
+        destination,
+        map_path=map_path,
+        reader=reader,
+        max_pass=3,
+        survey_stride=64,
+    )
+    assert result.easy_skipped_bytes == 0
+    assert reader.calls
+    assert destination.read_bytes()[128:192] == payload[128:192]

@@ -569,14 +569,23 @@ def rescue(
 
     def run_pass2() -> None:
         sweep_skips(survey=True, label="Pass 2: filling likely-good survey gaps")
-        state.current_pass = 3
         state.pass_cursor = 0
         state.adaptive_skip = 0
+        if state.easy_skipped_bytes > 0:
+            checkpoint()
+            event("normal", "Survey gaps remain; not entering Pass 3")
+            report("normal", force=True)
+            return
+        state.current_pass = 3
         checkpoint()
         event("normal", "Pass 2 complete; slow/error skips remain for Pass 3")
         report("normal", force=True)
 
     def run_pass3() -> None:
+        if state.easy_skipped_bytes > 0:
+            event("normal", "Survey gaps remain; returning to Pass 2")
+            state.current_pass = 2
+            return
         sweep_skips(survey=False, label="Pass 3: retrying slow/error skips")
         state.current_pass = 4
         state.pass_cursor = 0
@@ -657,10 +666,14 @@ def rescue(
         if state.easy_skipped_bytes > 0 and max_pass >= 2 and state.current_pass > 2:
             state.current_pass = 2
         while state.current_pass <= max_pass:
+            if state.easy_skipped_bytes > 0 and max_pass >= 2 and state.current_pass > 2:
+                state.current_pass = 2
             if state.current_pass == 1:
                 run_pass1()
             elif state.current_pass == 2:
                 run_pass2()
+                if state.easy_skipped_bytes > 0:
+                    break
             elif state.current_pass == 3:
                 run_pass3()
             elif state.current_pass == 4:
