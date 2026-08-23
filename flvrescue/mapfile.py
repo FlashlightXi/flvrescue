@@ -9,6 +9,8 @@ from os import PathLike
 from pathlib import Path
 from typing import Any, Iterable, Literal
 
+from .policy import RecoveryPolicy
+
 
 MAP_VERSION = 2
 RangeStatus = Literal["recovered", "skipped", "unreadable", "unprocessed"]
@@ -98,6 +100,7 @@ class RescueMap:
     current_pass: int = 1
     pass_cursor: int = 0
     adaptive_skip: int = 0
+    policy: RecoveryPolicy | None = None
     version: int = MAP_VERSION
 
     def __post_init__(self) -> None:
@@ -118,6 +121,8 @@ class RescueMap:
             raise MapValidationError("current_pass must be between 1 and 5")
         _require_nonnegative_int(self.pass_cursor, "pass_cursor")
         _require_nonnegative_int(self.adaptive_skip, "adaptive_skip")
+        if self.policy is not None and not isinstance(self.policy, RecoveryPolicy):
+            raise MapValidationError("policy must be a RecoveryPolicy or null")
         if self.pass_cursor > self.source_size:
             raise MapValidationError("pass_cursor exceeds source_size")
 
@@ -244,7 +249,7 @@ class RescueMap:
 
     def to_dict(self) -> dict[str, object]:
         self.validate()
-        return {
+        value: dict[str, object] = {
             "version": self.version,
             "source_path": self.source_path,
             "source_size": self.source_size,
@@ -254,6 +259,9 @@ class RescueMap:
             "adaptive_skip": self.adaptive_skip,
             "ranges": [item.to_dict() for item in self.ranges],
         }
+        if self.policy is not None:
+            value["policy"] = self.policy.to_dict()
+        return value
 
 
 def _range_from_json(value: object, index: int) -> RecoveryRange:
@@ -324,6 +332,15 @@ def _migrate_v1(value: dict[object, object]) -> RescueMap:
     return state
 
 
+def _policy_from_json(value: object) -> RecoveryPolicy | None:
+    if value is None:
+        return None
+    try:
+        return RecoveryPolicy.from_dict(value)
+    except ValueError as exc:
+        raise MapValidationError(f"invalid recovery policy: {exc}") from exc
+
+
 def map_from_dict(value: object) -> RescueMap:
     if not isinstance(value, dict):
         raise MapValidationError("map root must be an object")
@@ -349,6 +366,7 @@ def map_from_dict(value: object) -> RescueMap:
         adaptive_skip=_require_nonnegative_int(
             value.get("adaptive_skip", 0), "adaptive_skip"
         ),
+        policy=_policy_from_json(value.get("policy")),
         version=version,
     )
     state.validate()

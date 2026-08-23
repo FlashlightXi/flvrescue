@@ -10,32 +10,32 @@ from pathlib import Path
 from typing import Callable, Protocol
 
 from .mapfile import MapValidationError, RecoveryRange, RescueMap, load_map, save_map_atomic
+from .policy import DEFAULT_POLICY, PASS_NAME_TO_NUMBER, RecoveryPolicy
 from .progress import ProgressReporter
 from .reader import FileReader, Reader
+from .storage import prepare_destination, zero_destination_range
 
 
-DEFAULT_BLOCK_SIZE = 8 * 1024 * 1024
-DEFAULT_FALLBACK_SIZE = 64 * 1024
-DEFAULT_SECTOR_SIZE = 4 * 1024
-DEFAULT_CHECKPOINT_INTERVAL = 64 * 1024 * 1024
-DEFAULT_SLOW_THRESHOLD = 2.0
-DEFAULT_SKIP_START = 8 * 1024 * 1024
-DEFAULT_SKIP_MAX = 1024 * 1024 * 1024
-DEFAULT_SKIP_FACTOR = 2
-DEFAULT_SKIP_RESET_AFTER = 1
-DEFAULT_SURVEY_STRIDE = 0
+# Legacy public constants remain available; DEFAULT_POLICY is the authoritative
+# source for their values.
+DEFAULT_BLOCK_SIZE = DEFAULT_POLICY.block
+DEFAULT_FALLBACK_SIZE = DEFAULT_POLICY.fallback
+DEFAULT_SECTOR_SIZE = DEFAULT_POLICY.sector
+DEFAULT_CHECKPOINT_INTERVAL = DEFAULT_POLICY.checkpoint
+DEFAULT_SLOW_THRESHOLD = DEFAULT_POLICY.slow_threshold
+DEFAULT_SKIP_START = DEFAULT_POLICY.skip_start
+DEFAULT_SKIP_MAX = DEFAULT_POLICY.skip_max
+DEFAULT_SKIP_FACTOR = DEFAULT_POLICY.skip_factor
+DEFAULT_SKIP_RESET_AFTER = DEFAULT_POLICY.skip_reset_after
+DEFAULT_SURVEY_STRIDE = DEFAULT_POLICY.survey_stride
 DEFAULT_MAX_PASS = 2
 
 
 class ProgressSink(Protocol):
     def update(self, **values: object) -> object: ...
-
     def begin_read(self, offset: int, size: int, *, status: str = "reading") -> object: ...
-
     def end_read(self, *, status: str) -> object: ...
-
     def event(self, kind: str, message: str) -> object: ...
-
     def close(self) -> object: ...
 
 
@@ -58,11 +58,7 @@ class RescueResult:
 
     @property
     def easy_skipped_bytes(self) -> int:
-        return sum(
-            item.length
-            for item in self.ranges
-            if item.status == "skipped" and item.cause == "survey"
-        )
+        return sum(item.length for item in self.ranges if item.status == "skipped" and item.cause == "survey")
 
     @property
     def hard_skipped_bytes(self) -> int:
@@ -117,36 +113,14 @@ def _same_path(left: Path, right: Path) -> bool:
         return False
 
 
-def next_skip_width(
-    width: int,
-    *,
-    skip_start: int,
-    skip_max: int,
-    skip_factor: int,
-    grow: bool,
-) -> int:
-    """Return the skip width used for the next jump."""
+def next_skip_width(width: int, *, skip_start: int, skip_max: int, skip_factor: int, grow: bool) -> int:
+    """Return the adaptive width used for the next jump."""
 
     current = width if width > 0 else skip_start
     if grow:
         grown = current * skip_factor
-        if grown <= current:
-            grown = current + skip_start
-        current = grown
+        current = grown if grown > current else current + skip_start
     return min(skip_max, max(skip_start, current))
-
-
-def _validate_sizes(block_size: int, fallback_size: int, sector_size: int) -> None:
-    values = {
-        "block_size": block_size,
-        "fallback_size": fallback_size,
-        "sector_size": sector_size,
-    }
-    for name, value in values.items():
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise ValueError(f"{name} must be a positive integer")
-    if block_size < fallback_size or fallback_size < sector_size:
-        raise ValueError("block_size >= fallback_size >= sector_size is required")
 
 
 def _write_at(handle: object, offset: int, data: bytes) -> None:
@@ -170,21 +144,9 @@ def _default_map_path(destination: Path) -> Path:
     return destination.with_name(f"{destination.name}.rescue.json")
 
 
-def _load_or_create_state(
-    map_path: Path,
-    source: Path,
-    source_size: int,
-    destination: Path,
-) -> tuple[RescueMap, bool]:
+def _load_or_create_state(map_path: Path, source: Path, source_size: int, destination: Path) -> tuple[RescueMap, bool]:
     if not map_path.exists():
-        return (
-            RescueMap(
-                source_path=str(source),
-                source_size=source_size,
-                destination_path=str(destination),
-            ),
-            False,
-        )
+        return RescueMap(str(source), source_size, str(destination)), False
     state = load_map(map_path)
     if state.source_path != str(source):
         raise MapValidationError("map source_path does not match the requested source")
@@ -199,9 +161,12 @@ def _make_progress(
     progress: ProgressSink | bool | None,
     source_size: int,
     label: str,
+    destination_label: str,
 ) -> ProgressSink | None:
     if progress is True:
-        return ProgressReporter(source_size, label=label)
+        return ProgressReporter(
+            source_size, label=label, destination_label=destination_label
+        )
     if progress is False or progress is None:
         return None
     required = ("update", "begin_read", "end_read", "event")
@@ -210,92 +175,165 @@ def _make_progress(
     return progress
 
 
-def rescue(
-    source: str | PathLike[str],
-    destination: str | PathLike[str],
+def _policy_overrides(
+    *, block_size: int | None, fallback_size: int | None, sector_size: int | None,
+    checkpoint_interval: int | None, slow_threshold: float | None, skip_start: int | None,
+    skip_max: int | None, skip_factor: int | None, skip_reset_after: int | None,
+    survey_stride: int | None,
+) -> dict[str, object]:
+    values = {
+        "block": block_size, "fallback": fallback_size, "sector": sector_size,
+        "checkpoint": checkpoint_interval, "slow_threshold": slow_threshold,
+        "skip_start": skip_start, "skip_max": skip_max, "skip_factor": skip_factor,
+        "skip_reset_after": skip_reset_after, "survey_stride": survey_stride,
+    }
+    return {name: value for name, value in values.items() if value is not None}
+
+
+def _resolve_policy(
+    state: RescueMap,
     *,
-    map_path: str | PathLike[str] | None = None,
-    reader_factory: ReaderFactory | None = None,
-    progress: ProgressSink | bool | None = None,
-    block_size: int = DEFAULT_BLOCK_SIZE,
-    fallback_size: int = DEFAULT_FALLBACK_SIZE,
-    sector_size: int = DEFAULT_SECTOR_SIZE,
-    checkpoint_interval: int = DEFAULT_CHECKPOINT_INTERVAL,
-    slow_threshold: float = DEFAULT_SLOW_THRESHOLD,
-    skip_start: int = DEFAULT_SKIP_START,
-    skip_max: int = DEFAULT_SKIP_MAX,
-    skip_factor: int = DEFAULT_SKIP_FACTOR,
-    skip_reset_after: int = DEFAULT_SKIP_RESET_AFTER,
-    survey_stride: int = DEFAULT_SURVEY_STRIDE,
-    max_pass: int = DEFAULT_MAX_PASS,
+    resuming: bool,
+    supplied_policy: RecoveryPolicy | None,
+    overrides: dict[str, object],
+) -> RecoveryPolicy:
+    if supplied_policy is not None and not isinstance(supplied_policy, RecoveryPolicy):
+        raise TypeError("policy must be a RecoveryPolicy or None")
+    if state.policy is None:
+        try:
+            base_policy = supplied_policy or DEFAULT_POLICY
+            state.policy = base_policy.with_overrides(**overrides)
+        except ValueError as exc:
+            raise ValueError(f"invalid recovery policy: {exc}") from exc
+        return state.policy
+    if not resuming:
+        raise RuntimeError("a new rescue map cannot already have a policy")
+    if supplied_policy is not None and supplied_policy != state.policy:
+        raise ValueError("recovery policy does not match the policy saved in the resume map")
+    try:
+        requested = state.policy.with_overrides(**overrides)
+    except ValueError as exc:
+        raise ValueError(f"invalid recovery policy override: {exc}") from exc
+    if requested != state.policy:
+        changed = [name for name, value in overrides.items() if getattr(state.policy, name) != value]
+        raise ValueError(
+            "recovery policy is already saved in the resume map; refusing to change "
+            + ", ".join(changed)
+        )
+    return state.policy
+
+
+def _pass_number(value: int | str, name: str) -> int:
+    if isinstance(value, str):
+        try:
+            return PASS_NAME_TO_NUMBER[value.lower()]
+        except KeyError as exc:
+            raise ValueError(f"{name} must be one of {', '.join(PASS_NAME_TO_NUMBER)}") from exc
+    if isinstance(value, bool) or not isinstance(value, int) or value not in (1, 2, 3, 4):
+        raise ValueError(f"{name} must be 1, 2, 3, or 4")
+    return value
+
+
+def _resolve_max_pass(max_pass: int | None, through: int | str | None) -> int:
+    if max_pass is None and through is None:
+        return DEFAULT_MAX_PASS
+    by_max = _pass_number(max_pass, "max_pass") if max_pass is not None else None
+    by_through = _pass_number(through, "through") if through is not None else None
+    if by_max is not None and by_through is not None and by_max != by_through:
+        raise ValueError("max_pass and through must name the same execution limit")
+    return by_max if by_max is not None else by_through  # type: ignore[return-value]
+
+
+def rescue(
+    source: str | PathLike[str], destination: str | PathLike[str], *,
+    map_path: str | PathLike[str] | None = None, reader_factory: ReaderFactory | None = None,
+    progress: ProgressSink | bool | None = None, policy: RecoveryPolicy | None = None,
+    block_size: int | None = None,
+    fallback_size: int | None = None, sector_size: int | None = None,
+    checkpoint_interval: int | None = None, slow_threshold: float | None = None,
+    skip_start: int | None = None, skip_max: int | None = None, skip_factor: int | None = None,
+    skip_reset_after: int | None = None, survey_stride: int | None = None,
+    max_pass: int | None = None, through: int | str | None = None,
     clock: Callable[[], float] = time.monotonic,
 ) -> RescueResult:
-    """Recover easy ranges first, then refine skipped and unreadable ranges."""
+    """Recover through an execution limit without silently changing its policy."""
 
-    _validate_sizes(block_size, fallback_size, sector_size)
-    for name, value in {
-        "checkpoint_interval": checkpoint_interval,
-        "skip_start": skip_start,
-        "skip_max": skip_max,
-        "skip_factor": skip_factor,
-        "skip_reset_after": skip_reset_after,
-    }.items():
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise ValueError(f"{name} must be a positive integer")
-    if isinstance(survey_stride, bool) or not isinstance(survey_stride, int) or survey_stride < 0:
-        raise ValueError("survey_stride must be a non-negative integer")
-    if skip_start > skip_max:
-        raise ValueError("skip_start must not exceed skip_max")
-    if isinstance(slow_threshold, bool) or not isinstance(slow_threshold, (int, float)):
-        raise ValueError("slow_threshold must be a positive number")
-    if slow_threshold <= 0:
-        raise ValueError("slow_threshold must be a positive number")
-    if isinstance(max_pass, bool) or not isinstance(max_pass, int) or max_pass not in (1, 2, 3, 4):
-        raise ValueError("max_pass must be 1, 2, 3, or 4")
-
+    execution_limit = _resolve_max_pass(max_pass, through)
+    overrides = _policy_overrides(
+        block_size=block_size, fallback_size=fallback_size, sector_size=sector_size,
+        checkpoint_interval=checkpoint_interval, slow_threshold=slow_threshold,
+        skip_start=skip_start, skip_max=skip_max, skip_factor=skip_factor,
+        skip_reset_after=skip_reset_after, survey_stride=survey_stride,
+    )
     source_path = _canonical_path(source)
     destination_path = _canonical_path(destination)
     if _same_path(source_path, destination_path):
         raise ValueError("source and destination must be different files")
-    resolved_map_path = (
-        _canonical_path(map_path) if map_path is not None else _default_map_path(destination_path)
-    )
+    resolved_map_path = _canonical_path(map_path) if map_path is not None else _default_map_path(destination_path)
     if _same_path(resolved_map_path, source_path):
         raise ValueError("map_path must be different from the source file")
     if _same_path(resolved_map_path, destination_path):
         raise ValueError("map_path must be different from the destination file")
     source_size = source_path.stat().st_size
-    state, resuming = _load_or_create_state(
-        resolved_map_path, source_path, source_size, destination_path
+    state, resuming = _load_or_create_state(resolved_map_path, source_path, source_size, destination_path)
+    had_policy = state.policy is not None
+    policy = _resolve_policy(
+        state,
+        resuming=resuming,
+        supplied_policy=policy,
+        overrides=overrides,
     )
-
-    if resuming:
-        if not destination_path.is_file():
-            raise FileNotFoundError("destination from resume map does not exist")
-        destination_size = destination_path.stat().st_size
-        required_end = max(
-            (item.end for item in state.ranges if item.status == "recovered"),
-            default=0,
+    recovered_end = max((item.end for item in state.ranges if item.status == "recovered"), default=0)
+    reporter = _make_progress(
+        progress, source_size, source_path.name, destination_path.name
+    )
+    destination_handle = None
+    try:
+        if reporter is not None:
+            reporter.update(
+                current_pass=min(state.current_pass, 4), pass_cursor=state.pass_cursor,
+                recovered=state.recovered_bytes, skipped=state.skipped_bytes,
+                slow=state.slow_bytes, unreadable=state.unreadable_bytes,
+                easy_skipped=state.easy_skipped_bytes, hard_skipped=state.hard_skipped_bytes,
+                ranges=tuple(
+                    (item.offset, item.length, item.status, item.cause)
+                    for item in state.ranges
+                ),
+                status="preparing", force=True,
+            )
+        destination_handle, preparation = prepare_destination(
+            destination_path, source_size, resuming=resuming, recovered_end=recovered_end
         )
-        if destination_size < required_end or destination_size > source_size:
-            raise MapValidationError(
-                "destination size is incompatible with committed recovered ranges"
+        if reporter is not None:
+            reporter.update(
+                current_pass=min(state.current_pass, 4), pass_cursor=state.pass_cursor,
+                recovered=state.recovered_bytes, skipped=state.skipped_bytes,
+                slow=state.slow_bytes, unreadable=state.unreadable_bytes,
+                easy_skipped=state.easy_skipped_bytes, hard_skipped=state.hard_skipped_bytes,
+                ranges=tuple(
+                    (item.offset, item.length, item.status, item.cause)
+                    for item in state.ranges
+                ),
+                status="preparing", storage_mode=preparation.mode, force=True,
             )
-        destination_handle = destination_path.open("r+b")
-        if destination_size < source_size:
-            destination_handle.truncate(source_size)
-            _flush_destination(destination_handle)
-    else:
-        if destination_path.exists():
-            raise FileExistsError(
-                "destination already exists without a matching rescue map; refusing to overwrite it"
-            )
-        destination_handle = destination_path.open("x+b")
-        destination_handle.truncate(source_size)
-        _flush_destination(destination_handle)
+            reporter.event("normal", f"Destination storage mode: {preparation.mode}")
+        # This save makes legacy v1/v2 maps policy-stable before a source read.
         save_map_atomic(resolved_map_path, state)
+    except BaseException:
+        if destination_handle is not None:
+            destination_handle.close()
+        if not resuming:
+            try:
+                destination_path.unlink()
+            except OSError:
+                pass
+        if reporter is not None:
+            close_reporter = getattr(reporter, "close", None)
+            if callable(close_reporter):
+                close_reporter()
+        raise
 
-    reporter = _make_progress(progress, source_size, source_path.name)
+    assert destination_handle is not None
     factory = reader_factory or FileReader
     reader: Reader | None = None
     dirty_bytes = 0
@@ -314,19 +352,12 @@ def rescue(
     def report(status: str, *, force: bool = False) -> None:
         if reporter is not None:
             reporter.update(
-                current_pass=min(state.current_pass, 4),
-                pass_cursor=state.pass_cursor,
-                recovered=state.recovered_bytes,
-                skipped=state.skipped_bytes,
-                slow=state.slow_bytes,
-                unreadable=state.unreadable_bytes,
-                easy_skipped=state.easy_skipped_bytes,
-                hard_skipped=state.hard_skipped_bytes,
-                ranges=tuple(
-                    (item.offset, item.length, item.status, item.cause) for item in state.ranges
-                ),
-                status=status,
-                force=force,
+                current_pass=min(state.current_pass, 4), pass_cursor=state.pass_cursor,
+                recovered=state.recovered_bytes, skipped=state.skipped_bytes,
+                slow=state.slow_bytes, unreadable=state.unreadable_bytes,
+                easy_skipped=state.easy_skipped_bytes, hard_skipped=state.hard_skipped_bytes,
+                ranges=tuple((item.offset, item.length, item.status, item.cause) for item in state.ranges),
+                status=status, force=force,
             )
 
     def read_once(offset: int, length: int, *, status: str) -> ReadOutcome:
@@ -348,10 +379,9 @@ def rescue(
                 if reporter is not None:
                     reporter.end_read(status="error")
                 return ReadOutcome(None, elapsed, "short read")
-            data = bytes(raw)
             if reporter is not None:
-                reporter.end_read(status="slow" if elapsed >= slow_threshold else "normal")
-            return ReadOutcome(data, elapsed, None)
+                reporter.end_read(status="slow" if elapsed >= policy.slow_threshold else "normal")
+            return ReadOutcome(bytes(raw), elapsed, None)
         except BaseException:
             if reporter is not None:
                 reporter.end_read(status="error")
@@ -365,41 +395,37 @@ def rescue(
 
     def zero_unreadable(offset: int, length: int) -> None:
         nonlocal dirty_bytes
-        _write_at(destination_handle, offset, b"\0" * length)
+        zero_destination_range(
+            destination_handle, offset, length, sparse=preparation.sparse
+        )
         state.replace_range(offset, length, "unreadable", "read_error")
         dirty_bytes += length
 
     def maybe_checkpoint(*, force: bool = False) -> None:
-        if force or dirty_bytes >= checkpoint_interval:
+        if force or dirty_bytes >= policy.checkpoint:
             checkpoint()
 
     def apply_adaptive_skip(cause: str, *, grow: bool = True) -> bool:
-        nonlocal fast_streak
         current = state.range_at(state.pass_cursor)
         if current is None or current.status != "unprocessed":
             return False
-        width = state.adaptive_skip or skip_start
+        width = state.adaptive_skip or policy.skip_start
         length = min(width, current.end - state.pass_cursor)
         offset = state.pass_cursor
         state.replace_range(offset, length, "skipped", cause)
         state.pass_cursor += length
         state.adaptive_skip = next_skip_width(
-            width,
-            skip_start=skip_start,
-            skip_max=skip_max,
-            skip_factor=skip_factor,
-            grow=grow,
+            width, skip_start=policy.skip_start, skip_max=policy.skip_max,
+            skip_factor=policy.skip_factor, grow=grow,
         )
         event("skip", f"Skip {length} bytes at offset {offset}; next width {state.adaptive_skip}")
         return True
 
     def apply_survey_skip() -> bool:
-        if survey_stride <= 0:
-            return False
         current = state.range_at(state.pass_cursor)
         if current is None or current.status != "unprocessed":
             return False
-        length = min(survey_stride, current.end - state.pass_cursor)
+        length = min(policy.survey_stride, current.end - state.pass_cursor)
         if length <= 0:
             return False
         offset = state.pass_cursor
@@ -412,7 +438,7 @@ def rescue(
         nonlocal fast_streak
         if state.adaptive_skip:
             fast_streak += 1
-            if fast_streak >= skip_reset_after:
+            if fast_streak >= policy.skip_reset_after:
                 event("normal", f"Normal read speed rediscovered at offset {offset}")
                 state.adaptive_skip = 0
                 fast_streak = 0
@@ -425,7 +451,7 @@ def rescue(
     def note_slow_or_error() -> None:
         nonlocal fast_streak
         fast_streak = 0
-        state.adaptive_skip = state.adaptive_skip or skip_start
+        state.adaptive_skip = state.adaptive_skip or policy.skip_start
 
     def run_pass1() -> None:
         state.pass_cursor = min(state.pass_cursor, source_size)
@@ -438,9 +464,9 @@ def rescue(
                 state.pass_cursor = item.end
                 continue
             offset = state.pass_cursor
-            length = min(block_size, item.end - offset)
+            length = min(policy.block, item.end - offset)
             outcome = read_once(offset, length, status="reading")
-            slow = outcome.succeeded and outcome.elapsed >= slow_threshold
+            slow = outcome.succeeded and outcome.elapsed >= policy.slow_threshold
             if outcome.data is not None:
                 write_recovered(offset, outcome.data, slow=slow)
                 state.pass_cursor += length
@@ -463,127 +489,125 @@ def rescue(
                 continue
             maybe_checkpoint()
             report("normal")
-        state.current_pass = 2
-        state.pass_cursor = 0
-        state.adaptive_skip = 0
+        state.current_pass, state.pass_cursor, state.adaptive_skip = 2, 0, 0
         checkpoint()
         event("normal", "Pass 1 complete; switching to Pass 2")
         report("normal", force=True)
 
-    def apply_pass2_jump() -> bool:
-        current = state.range_at(state.pass_cursor)
-        if current is None or current.status != "skipped":
-            return False
-        width = state.adaptive_skip or skip_start
-        length = min(width, current.end - state.pass_cursor)
-        offset = state.pass_cursor
-        state.pass_cursor += length
-        state.adaptive_skip = next_skip_width(
-            width,
-            skip_start=skip_start,
-            skip_max=skip_max,
-            skip_factor=skip_factor,
-            grow=True,
-        )
-        event("skip", f"Skip-retry jump {length} bytes from offset {offset}")
-        return True
+    def run_pass2() -> None:
+        """Fill survey holes independently; one failure never poisons the next."""
 
-    def sweep_skips(*, survey: bool, label: str) -> None:
-        def matches(item: RecoveryRange) -> bool:
-            if item.status != "skipped":
-                return False
-            is_survey = item.cause == "survey"
-            return is_survey if survey else not is_survey
-
-        state.pass_cursor = 0
-        state.adaptive_skip = 0
-        event("normal", label)
+        state.pass_cursor, state.adaptive_skip = 0, 0
+        event("normal", "Pass 2: filling likely-good survey gaps")
         report("normal", force=True)
-        while state.pass_cursor < source_size:
-            item = state.range_at(state.pass_cursor)
-            if item is None:
-                break
-            if not matches(item):
-                state.pass_cursor = item.end
-                continue
-            offset = state.pass_cursor
-            probe = block_size if item.cause == "survey" else fallback_size
-            length = min(probe, item.end - offset)
-            outcome = read_once(offset, length, status="reading")
-            slow = outcome.succeeded and outcome.elapsed >= slow_threshold
-            if outcome.data is not None:
-                write_recovered(offset, outcome.data, slow=slow)
-                state.pass_cursor += length
-                if slow:
-                    event(
-                        "slow",
-                        f"Slow skip-retry at offset {offset}: {outcome.elapsed:.2f}s",
-                    )
-                    state.adaptive_skip = state.adaptive_skip or skip_start
-                    apply_pass2_jump()
+        holes = tuple(item for item in state.ranges_for("skipped") if item.cause == "survey")
+        for hole in holes:
+            cursor = hole.offset
+            while cursor < hole.end:
+                length = min(policy.block, hole.end - cursor)
+                outcome = read_once(cursor, length, status="reading")
+                slow = outcome.succeeded and outcome.elapsed >= policy.slow_threshold
+                if outcome.data is not None:
+                    write_recovered(cursor, outcome.data, slow=slow)
+                    cursor += length
+                    state.pass_cursor = cursor
+                    if slow:
+                        event("slow", f"Slow survey-hole read at offset {cursor - length}: {outcome.elapsed:.2f}s")
+                        if cursor < hole.end:
+                            state.replace_range(cursor, hole.end - cursor, "skipped", "slow")
+                        maybe_checkpoint(force=True)
+                        report("skip")
+                        break
+                else:
+                    zero_unreadable(cursor, length)
+                    cursor += length
+                    state.pass_cursor = cursor
+                    event("error", f"Survey-hole read failure at offset {cursor - length}: {outcome.failure}")
+                    if cursor < hole.end:
+                        state.replace_range(cursor, hole.end - cursor, "skipped", "read_error")
                     maybe_checkpoint(force=True)
                     report("skip")
-                    continue
-                if state.adaptive_skip:
-                    event(
-                        "normal",
-                        f"Normal region rediscovered during skip-retry at offset {offset}",
-                    )
-                    state.adaptive_skip = 0
-            else:
-                zero_unreadable(offset, length)
-                state.pass_cursor += length
-                event(
-                    "error",
-                    f"Skip-retry failure at offset {offset}: {outcome.failure}",
-                )
-                state.adaptive_skip = state.adaptive_skip or skip_start
-                apply_pass2_jump()
-                maybe_checkpoint(force=True)
-                report("skip")
-                continue
-            maybe_checkpoint()
-            report("normal")
-
-    def run_pass2() -> None:
-        sweep_skips(survey=True, label="Pass 2: filling likely-good survey gaps")
+                    break
+                maybe_checkpoint()
+                report("normal")
+            state.pass_cursor = hole.end
+        state.pass_cursor, state.adaptive_skip = 0, 0
+        if state.easy_skipped_bytes > 0:
+            checkpoint()
+            event("normal", "Survey gaps remain; not entering Pass 3")
+            report("normal", force=True)
+            return
         state.current_pass = 3
-        state.pass_cursor = 0
-        state.adaptive_skip = 0
         checkpoint()
-        event("normal", "Pass 2 complete; slow/error skips remain for Pass 3")
+        event("normal", "Pass 2 complete; slow/error ranges remain for Pass 3")
         report("normal", force=True)
 
     def run_pass3() -> None:
-        sweep_skips(survey=False, label="Pass 3: retrying slow/error skips")
-        state.current_pass = 4
-        state.pass_cursor = 0
-        state.adaptive_skip = 0
+        """Coarsely retry each hard range.  Fine localization is Pass 4 only."""
+
+        if state.easy_skipped_bytes > 0:
+            state.current_pass = 2
+            event("normal", "Survey gaps remain; returning to Pass 2")
+            return
+        state.pass_cursor, state.adaptive_skip = 0, 0
+        event("normal", "Pass 3: coarsely retrying slow/error ranges")
+        report("normal", force=True)
+        targets = tuple(
+            item for item in state.ranges_for("skipped", "unreadable")
+            if item.status == "unreadable" or item.cause != "survey"
+        )
+        for target in targets:
+            cursor = target.offset
+            while cursor < target.end:
+                length = min(policy.block, target.end - cursor)
+                outcome = read_once(cursor, length, status="reading")
+                slow = outcome.succeeded and outcome.elapsed >= policy.slow_threshold
+                if outcome.data is not None:
+                    write_recovered(cursor, outcome.data, slow=slow)
+                    cursor += length
+                    state.pass_cursor = cursor
+                    if slow:
+                        event("slow", f"Slow coarse retry at offset {cursor - length}: {outcome.elapsed:.2f}s")
+                        if target.status == "skipped" and cursor < target.end:
+                            state.replace_range(cursor, target.end - cursor, "skipped", "slow")
+                        maybe_checkpoint(force=True)
+                        report("skip")
+                        break
+                else:
+                    zero_unreadable(cursor, length)
+                    cursor += length
+                    state.pass_cursor = cursor
+                    event("error", f"Coarse retry failure at offset {cursor - length}: {outcome.failure}")
+                    if target.status == "skipped" and cursor < target.end:
+                        state.replace_range(cursor, target.end - cursor, "skipped", "read_error")
+                    maybe_checkpoint(force=True)
+                    report("skip")
+                    break
+                maybe_checkpoint()
+                report("normal")
+            state.pass_cursor = target.end
+        state.current_pass, state.pass_cursor, state.adaptive_skip = 4, 0, 0
         checkpoint()
-        event("normal", "Pass 3 complete; Deep recovery remains optional")
+        event("normal", "Pass 3 complete; deep recovery remains optional")
         report("normal", force=True)
 
     def recover_sectors(offset: int, length: int) -> None:
         cursor = offset
         end = offset + length
         while cursor < end:
-            size = min(sector_size, end - cursor)
+            size = min(policy.sector, end - cursor)
             outcome = read_once(cursor, size, status="reading")
             if outcome.data is None:
                 zero_unreadable(cursor, size)
             else:
-                write_recovered(
-                    cursor,
-                    outcome.data,
-                    slow=outcome.elapsed >= slow_threshold,
-                )
+                write_recovered(cursor, outcome.data, slow=outcome.elapsed >= policy.slow_threshold)
             cursor += size
 
     def recover_fallback_piece(offset: int, length: int) -> None:
         outcome = read_once(offset, length, status="reading")
         if outcome.data is not None:
-            write_recovered(offset, outcome.data, slow=outcome.elapsed >= slow_threshold)
-        elif length <= sector_size:
+            write_recovered(offset, outcome.data, slow=outcome.elapsed >= policy.slow_threshold)
+        elif length <= policy.sector:
             zero_unreadable(offset, length)
         else:
             recover_sectors(offset, length)
@@ -591,18 +615,17 @@ def rescue(
     def recover_deep_block(offset: int, length: int) -> bool:
         outcome = read_once(offset, length, status="reading")
         if outcome.data is not None:
-            write_recovered(offset, outcome.data, slow=outcome.elapsed >= slow_threshold)
+            write_recovered(offset, outcome.data, slow=outcome.elapsed >= policy.slow_threshold)
             return False
         event("error", f"Deep block read failure at offset {offset}; localizing")
-        if length <= sector_size:
+        if length <= policy.sector:
             zero_unreadable(offset, length)
-        elif length <= fallback_size:
+        elif length <= policy.fallback:
             recover_sectors(offset, length)
         else:
             cursor = offset
-            end = offset + length
-            while cursor < end:
-                size = min(fallback_size, end - cursor)
+            while cursor < offset + length:
+                size = min(policy.fallback, offset + length - cursor)
                 recover_fallback_piece(cursor, size)
                 cursor += size
         return True
@@ -617,26 +640,34 @@ def rescue(
                 state.pass_cursor = item.end
                 continue
             offset = state.pass_cursor
-            length = min(block_size, item.end - offset)
+            length = min(policy.block, item.end - offset)
             localized = recover_deep_block(offset, length)
             state.pass_cursor += length
             maybe_checkpoint(force=localized)
             report("error" if localized else "normal")
-        state.current_pass = 5
-        state.pass_cursor = source_size
-        state.adaptive_skip = 0
+        state.current_pass, state.pass_cursor, state.adaptive_skip = 5, source_size, 0
         checkpoint()
         event("complete", "Pass 4 complete")
         report("complete", force=True)
 
     try:
+        if not had_policy:
+            event("normal", f"Adopted recovery policy {policy.profile} v{policy.version}")
         reader = factory(source_path)
         report("starting", force=True)
-        while state.current_pass <= max_pass:
+        if execution_limit >= 2 and state.current_pass > 2 and state.easy_skipped_bytes > 0:
+            state.current_pass = 2
+        while state.current_pass <= execution_limit:
+            # Older/interrupted maps may claim Pass 3 while blue survey gaps
+            # still exist.  Fill those before any slow/error retry.
+            if execution_limit >= 2 and state.current_pass > 2 and state.easy_skipped_bytes > 0:
+                state.current_pass = 2
             if state.current_pass == 1:
                 run_pass1()
             elif state.current_pass == 2:
                 run_pass2()
+                if state.easy_skipped_bytes > 0:
+                    break
             elif state.current_pass == 3:
                 run_pass3()
             elif state.current_pass == 4:
@@ -645,14 +676,7 @@ def rescue(
                 break
         checkpoint()
         report("complete" if state.current_pass >= 5 else "normal", force=True)
-        return RescueResult(
-            source=source_path,
-            destination=destination_path,
-            map_path=resolved_map_path,
-            source_size=source_size,
-            current_pass=state.current_pass,
-            ranges=tuple(state.ranges),
-        )
+        return RescueResult(source_path, destination_path, resolved_map_path, source_size, state.current_pass, tuple(state.ranges))
     except KeyboardInterrupt:
         checkpoint()
         event("error", "Interrupted; destination and map checkpointed")

@@ -214,8 +214,8 @@ def format_stats_line(
     return " ".join(parts)
 
 
-def format_live_header(name: str, total: int) -> str:
-    return f"FLVRESCUE reads {name} ({format_bytes(total)})"
+def format_live_header(name: str, total: int, *, current_pass: int = 1) -> str:
+    return f"FLVRESCUE {format_pass_label(current_pass)} reads {name} ({format_bytes(total)})"
 
 
 def format_live_lines(
@@ -226,21 +226,54 @@ def format_live_lines(
     elapsed: float,
     width: int,
     color: bool,
+    current_pass: int = 1,
 ) -> list[str]:
-    header = format_live_header(name, total)
+    header = format_live_header(name, total, current_pass=current_pass)
     suffix = f" {format_bytes(counts.get('good', 0))} {format_clock(elapsed)}"
     bar_width = max(8, width - len(suffix))
     bar = render_stacked_bar(counts, bar_width, color=color)
     return [header, f"{bar}{suffix}", format_stats_line(counts, color=color)]
 
 
+def format_preparing_lines(
+    *,
+    name: str,
+    total: int,
+    elapsed: float,
+    spinner: str,
+    storage_mode: str | None = None,
+    allocated_bytes: int | None = None,
+) -> list[str]:
+    """Render destination preparation without inventing a percentage complete."""
+
+    lines = [
+        f"FLVRESCUE prepares {name}",
+        f"Preparing destination {spinner} {format_clock(elapsed)}",
+        f"Source extent: {format_bytes(total)}",
+    ]
+    if storage_mode:
+        detail = f"Storage mode: {storage_mode}"
+        if allocated_bytes is not None:
+            detail += f"  Allocated: {format_bytes(allocated_bytes)}"
+        lines.append(detail)
+    return lines
+
+
 PASS_TITLES = {
-    1: "fast scan",
-    2: "fill likely-good skips",
-    3: "retry slow/error skips",
-    4: "deep recovery",
-    5: "complete",
+    1: "Survey",
+    2: "Fill",
+    3: "Retry",
+    4: "Deep",
 }
+
+
+def format_pass_label(pass_number: int) -> str:
+    """Return the stable, user-facing label for a recovery pass."""
+
+    title = PASS_TITLES.get(pass_number)
+    if title is None:
+        return "Complete" if pass_number >= 5 else "Unknown pass"
+    return f"Pass {pass_number} {title}"
 
 
 def format_status_view(
@@ -268,7 +301,7 @@ def format_status_view(
     if current_pass >= 5:
         phase = "complete"
     else:
-        phase = f"pass {current_pass}  next: {PASS_TITLES.get(current_pass, 'unknown')}"
+        phase = f"next: {format_pass_label(current_pass)}"
     footer = [
         f"FLVRESCUE status {name} ({format_bytes(total)})  {phase}",
         format_stats_line(counts, color=color, include_pending=True),

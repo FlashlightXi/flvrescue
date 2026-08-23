@@ -6,6 +6,7 @@ from flvrescue.display import (
     GLYPH_PENDING,
     GLYPH_SKIP,
     format_live_lines,
+    format_preparing_lines,
     format_status_view,
     range_kind,
     render_stacked_bar,
@@ -45,7 +46,7 @@ def test_live_lines_match_requested_layout() -> None:
         width=40,
         color=False,
     )
-    assert lines[0].startswith("FLVRESCUE reads 493.flv")
+    assert lines[0].startswith("FLVRESCUE Pass 1 Survey reads 493.flv")
     assert "02:55" in lines[1]
     assert lines[2].startswith("good ")
     assert "fast " in lines[2]
@@ -96,7 +97,22 @@ def test_status_view_fills_rows_in_offset_order() -> None:
     assert body[0] == GLYPH_GOOD * 20
     assert GLYPH_SKIP in body[1]
     assert GLYPH_BAD in body[2]
-    assert "pass 2" in body[-3]
-    assert "next: fill likely-good skips" in body[-3]
+    assert "next: Pass 2 Fill" in body[-3]
     assert "todo " in body[-2]
     assert body[-1].startswith("map ")
+
+
+def test_preparing_lines_show_elapsed_time_without_a_fake_percent() -> None:
+    lines = format_preparing_lines(
+        name="rescued.flv",
+        total=76 * 1024**3,
+        elapsed=5,
+        spinner="/",
+        storage_mode="sparse",
+        allocated_bytes=0,
+    )
+    assert lines[0] == "FLVRESCUE prepares rescued.flv"
+    assert lines[1] == "Preparing destination / 00:05"
+    assert "Source extent: 76.0 GiB" in lines[2]
+    assert lines[3] == "Storage mode: sparse  Allocated: 0 B"
+    assert "%" not in "\n".join(lines)

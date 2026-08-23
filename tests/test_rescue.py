@@ -8,13 +8,36 @@ from pathlib import Path
 import pytest
 
 from conftest import FaultInjectingReader, SlowInjectingReader
-from flvrescue import rescue
+from flvrescue import DEFAULT_POLICY, RecoveryPolicy, RecoveryRange, RescueMap, rescue
+from flvrescue.mapfile import save_map_atomic
 from flvrescue.progress import ProgressReporter
 
 
 BLOCK = 32
 FALLBACK = 8
 SECTOR = 2
+
+
+class RecordingProgress:
+    def __init__(self) -> None:
+        self.updates: list[dict[str, object]] = []
+        self.events: list[tuple[str, str]] = []
+        self.closed = False
+
+    def update(self, **values: object) -> None:
+        self.updates.append(values)
+
+    def begin_read(self, offset: int, size: int, *, status: str = "reading") -> None:
+        pass
+
+    def end_read(self, *, status: str) -> None:
+        pass
+
+    def event(self, kind: str, message: str) -> None:
+        self.events.append((kind, message))
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def patterned_bytes(size: int) -> bytes:
@@ -43,6 +66,8 @@ def run_rescue(
         "slow_threshold": 0.01,
         "skip_start": BLOCK,
         "skip_max": BLOCK * 4,
+        "skip_reset_after": 1,
+        "survey_stride": 0,
         "max_pass": max_pass,
     }
     options.update(kwargs)
@@ -76,6 +101,25 @@ def test_normal_copy_preserves_bytes_and_finishes_default_two_passes(tmp_path: P
     assert map_data["ranges"] == [
         {"offset": 0, "length": len(payload), "status": "recovered"}
     ]
+
+
+def test_destination_preparation_is_reported_before_source_reads(tmp_path: Path) -> None:
+    source = tmp_path / "source.flv"
+    destination = tmp_path / "rescued.flv"
+    payload = patterned_bytes(64)
+    source.write_bytes(payload)
+    progress = RecordingProgress()
+
+    run_rescue(source, destination, progress=progress, max_pass=1)
+
+    assert progress.updates[0]["status"] == "preparing"
+    assert any(
+        update.get("status") == "preparing"
+        and update.get("storage_mode") in {"sparse", "lazy"}
+        for update in progress.updates
+    )
+    assert any(message.startswith("Destination storage mode: ") for _, message in progress.events)
+    assert progress.closed
 
 
 def test_pass1_failure_skips_without_fine_fallback(tmp_path: Path) -> None:
@@ -141,7 +185,9 @@ def test_pass2_reads_only_ranges_skipped_by_pass1(tmp_path: Path) -> None:
         max_pass=3,
     )
 
-    assert second_reader.calls == [(32, 8), (40, 8), (48, 8), (56, 8)]
+    # Pass 3 is deliberately coarse.  Fine 64K/sector localization belongs to
+    # Pass 4 so a deadline-bound retry cannot turn into a long small-read loop.
+    assert second_reader.calls == [(32, 32)]
     assert destination.read_bytes() == payload
     assert result.skipped_bytes == 0
     assert result.current_pass == 4
@@ -211,7 +257,9 @@ def test_resume_does_not_reread_committed_recovered_range(tmp_path: Path) -> Non
     assert destination.read_bytes() == payload
 
 
-def test_v1_map_is_migrated_without_rereading_completed_prefix(tmp_path: Path) -> None:
+def test_v1_map_is_migrated_without_rereading_completed_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     source = tmp_path / "source.flv"
     destination = tmp_path / "rescued.flv"
     map_path = tmp_path / "rescued.map.json"
@@ -220,6 +268,9 @@ def test_v1_map_is_migrated_without_rereading_completed_prefix(tmp_path: Path) -
     partial = bytearray(payload[:32])
     partial[10:12] = b"\0\0"
     destination.write_bytes(partial)
+    monkeypatch.setattr(
+        "flvrescue.storage._requires_sparse_destination", lambda: False
+    )
     map_path.write_text(
         json.dumps(
             {
@@ -245,8 +296,216 @@ def test_v1_map_is_migrated_without_rereading_completed_prefix(tmp_path: Path) -
 
     assert reader.calls[0] == (32, 32)
     assert read_map(map_path)["version"] == 2
+    assert read_map(map_path)["policy"]["profile"] == "coverage"
     assert destination.read_bytes()[:10] == payload[:10]
     assert destination.read_bytes()[10:12] == b"\0\0"
+
+
+def test_saved_policy_rejects_a_different_resume_override_before_any_read(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.flv"
+    destination = tmp_path / "rescued.flv"
+    map_path = tmp_path / "rescued.map.json"
+    payload = patterned_bytes(64)
+    source.write_bytes(payload)
+    run_rescue(source, destination, map_path=map_path, reader=FaultInjectingReader(payload), max_pass=1)
+
+    resumed = FaultInjectingReader(payload)
+    with pytest.raises(ValueError, match="already saved"):
+        rescue(
+            source,
+            destination,
+            map_path=map_path,
+            reader_factory=lambda _source: resumed,
+            block_size=BLOCK * 2,
+            max_pass=1,
+            progress=False,
+        )
+    assert resumed.calls == []
+
+
+def test_policyless_v2_map_adopts_default_coverage_before_source_read(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.flv"
+    destination = tmp_path / "rescued.flv"
+    map_path = tmp_path / "rescued.map.json"
+    payload = patterned_bytes(32)
+    source.write_bytes(payload)
+    destination.write_bytes(payload)
+    save_map_atomic(
+        map_path,
+        RescueMap(
+            source_path=str(source.resolve()),
+            source_size=len(payload),
+            destination_path=str(destination.resolve()),
+            ranges=[RecoveryRange(0, len(payload), "recovered")],
+            current_pass=2,
+        ),
+    )
+    reader = FaultInjectingReader(payload)
+
+    rescue(
+        source,
+        destination,
+        map_path=map_path,
+        reader_factory=lambda _source: reader,
+        progress=False,
+        max_pass=2,
+    )
+
+    assert reader.calls == []
+    assert read_map(map_path)["policy"] == DEFAULT_POLICY.to_dict()
+
+
+def test_pass2_stops_only_the_current_survey_hole_on_error(tmp_path: Path) -> None:
+    source = tmp_path / "source.flv"
+    destination = tmp_path / "rescued.flv"
+    map_path = tmp_path / "rescued.map.json"
+    payload = patterned_bytes(192)
+    source.write_bytes(payload)
+    destination.write_bytes(payload)
+    policy = RecoveryPolicy(
+        block=BLOCK,
+        fallback=FALLBACK,
+        sector=SECTOR,
+        checkpoint=BLOCK,
+        slow_threshold=0.01,
+        skip_start=BLOCK,
+        skip_max=BLOCK * 4,
+        skip_reset_after=1,
+        survey_stride=BLOCK,
+    )
+    state = RescueMap(
+        source_path=str(source.resolve()),
+        source_size=len(payload),
+        destination_path=str(destination.resolve()),
+        ranges=[
+            RecoveryRange(0, 32, "recovered"),
+            RecoveryRange(32, 64, "skipped", "survey"),
+            RecoveryRange(96, 32, "recovered"),
+            RecoveryRange(128, 32, "skipped", "survey"),
+            RecoveryRange(160, 32, "recovered"),
+        ],
+        current_pass=2,
+        policy=policy,
+    )
+    save_map_atomic(map_path, state)
+
+    reader = FaultInjectingReader(payload, bad_ranges=[(40, 2)])
+    result = rescue(
+        source,
+        destination,
+        map_path=map_path,
+        reader_factory=lambda _source: reader,
+        progress=False,
+        max_pass=2,
+    )
+
+    assert reader.calls == [(32, 32), (128, 32)]
+    assert result.easy_skipped_bytes == 0
+    assert [(item.offset, item.length, item.status, item.cause) for item in result.ranges] == [
+        (0, 32, "recovered", None),
+        (32, 32, "unreadable", "read_error"),
+        (64, 32, "skipped", "read_error"),
+        (96, 96, "recovered", None),
+    ]
+
+
+def test_resume_repeats_pass2_when_a_later_current_pass_has_survey_holes(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.flv"
+    destination = tmp_path / "rescued.flv"
+    map_path = tmp_path / "rescued.map.json"
+    payload = patterned_bytes(96)
+    source.write_bytes(payload)
+    destination.write_bytes(payload)
+    policy = DEFAULT_POLICY.with_overrides(
+        block=BLOCK,
+        fallback=FALLBACK,
+        sector=SECTOR,
+        checkpoint=BLOCK,
+        survey_stride=BLOCK,
+    )
+    save_map_atomic(
+        map_path,
+        RescueMap(
+            source_path=str(source.resolve()),
+            source_size=len(payload),
+            destination_path=str(destination.resolve()),
+            ranges=[
+                RecoveryRange(0, 32, "recovered"),
+                RecoveryRange(32, 32, "skipped", "survey"),
+                RecoveryRange(64, 32, "recovered"),
+            ],
+            current_pass=3,
+            policy=policy,
+        ),
+    )
+    reader = FaultInjectingReader(payload)
+
+    result = rescue(
+        source,
+        destination,
+        map_path=map_path,
+        reader_factory=lambda _source: reader,
+        progress=False,
+        max_pass=2,
+    )
+
+    assert reader.calls == [(32, 32)]
+    assert result.current_pass == 3
+    assert result.easy_skipped_bytes == 0
+
+
+def test_retry_request_fills_leftover_survey_hole_before_hard_range(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.flv"
+    destination = tmp_path / "rescued.flv"
+    map_path = tmp_path / "rescued.map.json"
+    payload = patterned_bytes(128)
+    source.write_bytes(payload)
+    destination.write_bytes(payload)
+    policy = DEFAULT_POLICY.with_overrides(
+        block=BLOCK,
+        fallback=FALLBACK,
+        sector=SECTOR,
+        checkpoint=BLOCK,
+        survey_stride=BLOCK,
+    )
+    save_map_atomic(
+        map_path,
+        RescueMap(
+            source_path=str(source.resolve()),
+            source_size=len(payload),
+            destination_path=str(destination.resolve()),
+            ranges=[
+                RecoveryRange(0, 32, "recovered"),
+                RecoveryRange(32, 32, "skipped", "slow"),
+                RecoveryRange(64, 32, "skipped", "survey"),
+                RecoveryRange(96, 32, "recovered"),
+            ],
+            current_pass=3,
+            policy=policy,
+        ),
+    )
+    reader = FaultInjectingReader(payload)
+
+    result = rescue(
+        source,
+        destination,
+        map_path=map_path,
+        reader_factory=lambda _source: reader,
+        progress=False,
+        max_pass=3,
+    )
+
+    assert reader.calls[:2] == [(64, 32), (32, 32)]
+    assert result.easy_skipped_bytes == 0
+    assert result.hard_skipped_bytes == 0
 
 
 def test_progress_updates_while_reader_is_blocked(tmp_path: Path) -> None:
@@ -407,6 +666,6 @@ def test_pass2_fills_survey_gaps_before_slow_skips(tmp_path: Path) -> None:
         max_pass=3,
         survey_stride=32,
     )
-    assert third_reader.calls[0] == (32, 8)
+    assert third_reader.calls[0] == (32, 32)
     assert filled.hard_skipped_bytes == 0
     assert destination.read_bytes() == payload
