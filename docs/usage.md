@@ -13,22 +13,49 @@ The program has no third-party runtime dependencies.
 ## Basic recovery
 
 ```powershell
-flvrescue damaged.flv rescued.flv
+flvrescue damaged.flv rescued.flv --through survey
 ```
 
-The source is opened read-only. The destination must be a different file on healthy, writable storage. A new destination is never silently overwritten.
+The source is opened read-only. The destination must be a different file on healthy, writable storage. On Windows it must support sparse files (normally NTFS or ReFS); capacity-unsafe fallback to a non-sparse destination is refused. A new destination is never silently overwritten.
 
-The default resume map is created as `rescued.flv.rescue.json`. Keep it with the partial output until recovery and validation are complete.
+The default resume map is created as `rescued.flv.rescue.json`. It stores the coverage policy as well as recovery ranges; keep it with the partial output until recovery and validation are complete.
+
+## Optional command recommendation
+
+Use `optimize` when you want a command chosen from the file size, destination free space, and one operational preference:
+
+```powershell
+flvrescue optimize damaged.flv rescued.flv
+flvrescue optimize damaged.flv rescued.flv --preference fast --no-input
+```
+
+On an interactive terminal, omitting `--preference` asks once for `fast`, `balanced`, or `thorough`. In scripts and redirected sessions it defaults to `balanced`. `--available-space 100G` can model a batch capacity different from the destination's currently detected free space.
+
+This command is deliberately advisory: it reads file metadata, not source contents; it does not create the destination or map; and it does not start recovery. Copy and run the printed ordinary `flvrescue SOURCE DEST ...` command. The resulting policy is then stored in the map as usual.
+
+If the detected or supplied free space is below the estimated Survey writes plus a safety reserve, `optimize` prints the required minimum and exits without generating a command.
+
+`--through` selects the furthest stage this invocation may run. Its default is `fill`, so `flvrescue damaged.flv rescued.flv` performs Survey then Fill with the standard coverage policy.
+
+| Stage | Purpose | When to use it |
+|---|---|---|
+| `survey` / `1` | Pass 1 Survey: sample across the whole file and preserve fast ranges | First step for every selected file |
+| `fill` / `2` | Pass 2 Fill: read likely-good survey gaps | Second step for every selected file |
+| `retry` / `3` | Pass 3 Retry: attempt slow/error gaps again | Only after overall coverage is secured |
+| `deep` / `4` | Pass 4 Deep: progressively smaller reads around stubborn gaps | Only for the highest-value files with time left |
 
 ## Resume
 
-After Ctrl+C, a crash, or another interruption, repeat the same command:
+After Ctrl+C, a crash, or another interruption, resume from the output or its map:
 
 ```powershell
-flvrescue damaged.flv rescued.flv
+flvrescue resume rescued.flv --through fill
+flvrescue resume rescued.flv.rescue.json --through fill
 ```
 
-Before resuming, `flvrescue` verifies the source path and size, destination path, pass cursor, and complete range map. It schedules only ranges that remain eligible for the current pass. Existing v1 maps are migrated when they are next checkpointed.
+When given a destination, `resume` accepts only the adjacent `DEST.rescue.json` map (or the exact map passed through `--map`). It verifies that `map.destination_path` matches the supplied destination before any recovery I/O. When given a `.json` map, it uses that exact map and its saved source and destination. It never falls back to another destination.
+
+Before resuming, `flvrescue` verifies the source path and size, destination path, pass cursor, saved policy, and complete range map. It schedules only ranges that remain eligible for the requested pass. Existing maps without a saved policy are visibly adopted into the current coverage policy once; later resumes use the saved policy.
 
 Do not edit the JSON map manually. A malformed or mismatched map is rejected. The map path must not refer to the source or destination, including through an existing hard link.
 
@@ -37,19 +64,20 @@ Do not edit the JSON map manually. A malformed or mismatched map is rejected. Th
 | Option | Default | Purpose |
 |---|---:|---|
 | `--map PATH` | `DEST.rescue.json` | Select the sidecar resume map |
-| `--block SIZE` | `8M` | Normal read size |
-| `--fallback SIZE` | `64K` | Read size after a normal-block error |
-| `--sector SIZE` | `4K` | Final read and zero-fill unit |
-| `--slow-threshold SECONDS` | `2.0` | Successful read duration treated as slow |
-| `--skip-start SIZE` | `8M` | Initial adaptive skip width after a slow or failed read |
-| `--skip-factor N` | `2` | Multiply skip width after each slow/error |
-| `--skip-max SIZE` | `1G` | Maximum adaptive skip width |
-| `--skip-reset-after N` | `1` | Consecutive fast reads required before leaving skip mode |
-| `--survey-stride SIZE` | `0` | Pass 1 whole-file sample skip after each fast read; `0` disables |
-| `--max-pass {1,2,3,4}` | `2` | Last pass to execute; Pass 4 is optional deep recovery |
+| `--through {survey,fill,retry,deep,1,2,3,4}` | `fill` | Furthest named recovery stage to run |
+| `--max-pass {1,2,3,4}` | — | Legacy numeric alias for `--through`; cannot be combined with it |
+| `--block SIZE` | saved policy | Advanced normal-read override for a new run |
+| `--fallback SIZE` | saved policy | Advanced read size after a normal-block error |
+| `--sector SIZE` | saved policy | Advanced final read and zero-fill unit |
+| `--checkpoint SIZE` | saved policy | Advanced durable checkpoint interval |
+| `--slow-threshold SECONDS` | saved policy | Advanced successful-read duration treated as slow |
+| `--skip-start`, `--skip-factor`, `--skip-max`, `--skip-reset-after` | saved policy | Advanced adaptive-skip overrides for a new run |
+| `--survey-stride SIZE` | saved policy | Advanced Pass 1 sampling override for a new run |
 | `--no-progress` | off | Suppress periodic progress output |
 
-Sizes accept byte counts or `K`, `M`, `G`, and `T` suffixes (1024-based). `8M`, `128MiB`, `64K`, and `1G` are valid. The read sizes must satisfy:
+The detailed controls are intentionally unavailable on `resume`: a different policy must not silently change an in-progress rescue. To use an advanced policy, specify the overrides on the initial command; they are then saved in the map.
+
+Sizes accept byte counts or `K`, `M`, `G`, and `T` suffixes (1024-based). `8M`, `128MiB`, `64K`, and `1G` are valid. The effective read sizes must satisfy:
 
 ```text
 block >= fallback >= sector > 0
@@ -60,17 +88,9 @@ Examples:
 ```powershell
 flvrescue damaged.flv rescued.flv --map rescued.map.json
 
+# Non-default strategy; it will be saved and reused by resume.
 flvrescue damaged.flv rescued.flv `
-  --block 8M `
-  --fallback 64K `
-  --sector 4K `
-  --slow-threshold 2 `
-  --max-pass 2
-
-# Coarse Pass 1: sample the file, grow skips quickly, stay in skip mode
-# until several fast reads in a row
-flvrescue damaged.flv rescued.flv `
-  --max-pass 1 `
+  --through survey `
   --survey-stride 128M `
   --skip-start 128M `
   --skip-factor 2 `
@@ -82,12 +102,21 @@ Run `flvrescue --help` for the installed version's complete CLI syntax.
 
 ## Progress and summary
 
-On a TTY, rescue uses a 3-line stacked bar, not an offset map:
+On a TTY, rescue uses a stacked bar, not an offset map. Its header names the current stage:
 
 ```text
-FLVRESCUE reads 493.flv (26.0 GiB)
+FLVRESCUE Pass 2 Fill reads 493.flv (26.0 GiB)
 ████▒▒▒▒▒▒▒              3.5 GiB 02:55
 good 1.7 GiB fast 10.5 GiB slow 7.3 GiB bad 332.4 MiB
+```
+
+During destination preparation, the display deliberately has no percentage because file allocation does not expose a trustworthy byte-by-byte completion value:
+
+```text
+FLVRESCUE prepares rescued.flv
+Preparing destination / 00:05
+Source extent: 76.0 GiB
+Storage mode: sparse
 ```
 
 - `█` good / recovered (green)
@@ -97,7 +126,7 @@ good 1.7 GiB fast 10.5 GiB slow 7.3 GiB bad 332.4 MiB
 
 Labels on the third line are gray; the numbers use the same colors as the bar.
 
-Pass 1 scans. Pass 2 fills blue likely-good skips. Pass 3 retries yellow slow/error skips. Pass 4 is optional deep recovery.
+Pass 1 Survey scans. Pass 2 Fill reads blue likely-good skips. Pass 3 Retry tries yellow slow/error skips. Pass 4 Deep is the optional fine-grained stage.
 
 To see the file in offset order, filling almost the whole terminal:
 
@@ -130,13 +159,13 @@ def read_at(offset: int, size: int) -> bytes:
     ...
 ```
 
-This is used by the test suite to raise controlled `OSError` instances or delay selected reads without touching a damaged drive. Pass limits, slow threshold, skip start/factor/max, skip-reset-after, survey stride, read sizes, checkpoint interval, and a custom progress sink can also be supplied.
+This is used by the test suite to raise controlled `OSError` instances or delay selected reads without touching a damaged drive. A `RecoveryPolicy` can be supplied for a new run; advanced `rescue()` keyword overrides are optional and are persisted with that policy. `max_pass` remains the library spelling for the requested last pass.
 
 Library calls checkpoint and then re-raise `KeyboardInterrupt`. The CLI catches that interruption, prints a resume message, and exits without a traceback.
 
 ## Resume-map format
 
-The v2 JSON map stores the active pass, its cursor, adaptive skip state, and a complete set of non-overlapping ranges:
+The v2 JSON map stores the policy, active pass, cursor, adaptive skip state, and a complete set of non-overlapping ranges:
 
 ```json
 {
@@ -144,6 +173,7 @@ The v2 JSON map stores the active pass, its cursor, adaptive skip state, and a c
   "source_path": "damaged.flv",
   "source_size": 107374182400,
   "destination_path": "rescued.flv",
+  "policy": {"version": 1, "profile": "coverage", "block": 8388608, "...": "..."},
   "current_pass": 2,
   "pass_cursor": 52428800,
   "adaptive_skip": 8388608,

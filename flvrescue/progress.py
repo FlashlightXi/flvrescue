@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass, replace
 from typing import Callable, TextIO
 
-from .display import format_live_lines, tally_kinds
+from .display import format_live_lines, format_preparing_lines, tally_kinds
 
 
 COLORS = {
@@ -57,6 +57,8 @@ class ProgressSnapshot:
     read_offset: int | None = None
     read_size: int = 0
     read_started_at: float | None = None
+    storage_mode: str | None = None
+    allocated_bytes: int | None = None
 
 
 class ProgressReporter:
@@ -67,6 +69,7 @@ class ProgressReporter:
         total: int,
         *,
         label: str = "file",
+        destination_label: str | None = None,
         stream: TextIO | None = None,
         update_interval: float = 1.0,
         clock: Callable[[], float] = time.monotonic,
@@ -77,6 +80,7 @@ class ProgressReporter:
             raise ValueError("update_interval must be greater than zero")
         self.total = total
         self.label = label
+        self.destination_label = destination_label or label
         self.stream = stream if stream is not None else sys.stderr
         self.update_interval = update_interval
         self._clock = clock
@@ -113,6 +117,8 @@ class ProgressReporter:
         easy_skipped: int = 0,
         hard_skipped: int = 0,
         ranges: tuple[tuple[int, int, str, str | None], ...] = (),
+        storage_mode: str | None = None,
+        allocated_bytes: int | None = None,
         force: bool = False,
     ) -> None:
         with self._lock:
@@ -128,6 +134,16 @@ class ProgressReporter:
                 hard_skipped=hard_skipped,
                 ranges=ranges,
                 status=status,
+                storage_mode=(
+                    storage_mode
+                    if storage_mode is not None
+                    else self._snapshot.storage_mode
+                ),
+                allocated_bytes=(
+                    allocated_bytes
+                    if allocated_bytes is not None
+                    else self._snapshot.allocated_bytes
+                ),
             )
         if force:
             self._wake.set()
@@ -177,6 +193,16 @@ class ProgressReporter:
 
     def _lines(self, snapshot: ProgressSnapshot, now: float) -> list[str]:
         elapsed = max(now - self._started_at, 0.0)
+        if snapshot.status == "preparing":
+            spinner = "|/-\\"[int(now * 4) % 4]
+            return format_preparing_lines(
+                name=self.destination_label,
+                total=snapshot.total,
+                elapsed=elapsed,
+                spinner=spinner,
+                storage_mode=snapshot.storage_mode,
+                allocated_bytes=snapshot.allocated_bytes,
+            )
         counts = tally_kinds(snapshot.ranges, snapshot.total)
         if snapshot.ranges or snapshot.recovered or snapshot.easy_skipped:
             counts["good"] = snapshot.recovered
@@ -193,6 +219,7 @@ class ProgressReporter:
             elapsed=elapsed,
             width=width,
             color=self._tty,
+            current_pass=snapshot.current_pass,
         )
 
     def _render(self, *, final: bool = False) -> None:
