@@ -114,8 +114,8 @@ class RescueMap:
         if not isinstance(self.destination_path, str) or not self.destination_path:
             raise MapValidationError("destination_path must be a non-empty string")
         _require_nonnegative_int(self.source_size, "source_size")
-        if not _is_int(self.current_pass) or not 1 <= self.current_pass <= 4:
-            raise MapValidationError("current_pass must be between 1 and 4")
+        if not _is_int(self.current_pass) or not 1 <= self.current_pass <= 5:
+            raise MapValidationError("current_pass must be between 1 and 5")
         _require_nonnegative_int(self.pass_cursor, "pass_cursor")
         _require_nonnegative_int(self.adaptive_skip, "adaptive_skip")
         if self.pass_cursor > self.source_size:

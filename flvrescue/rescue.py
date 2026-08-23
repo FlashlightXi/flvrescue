@@ -198,9 +198,10 @@ def _load_or_create_state(
 def _make_progress(
     progress: ProgressSink | bool | None,
     source_size: int,
+    label: str,
 ) -> ProgressSink | None:
     if progress is True:
-        return ProgressReporter(source_size)
+        return ProgressReporter(source_size, label=label)
     if progress is False or progress is None:
         return None
     required = ("update", "begin_read", "end_read", "event")
@@ -249,8 +250,8 @@ def rescue(
         raise ValueError("slow_threshold must be a positive number")
     if slow_threshold <= 0:
         raise ValueError("slow_threshold must be a positive number")
-    if isinstance(max_pass, bool) or not isinstance(max_pass, int) or max_pass not in (1, 2, 3):
-        raise ValueError("max_pass must be 1, 2, or 3")
+    if isinstance(max_pass, bool) or not isinstance(max_pass, int) or max_pass not in (1, 2, 3, 4):
+        raise ValueError("max_pass must be 1, 2, 3, or 4")
 
     source_path = _canonical_path(source)
     destination_path = _canonical_path(destination)
@@ -294,7 +295,7 @@ def rescue(
         _flush_destination(destination_handle)
         save_map_atomic(resolved_map_path, state)
 
-    reporter = _make_progress(progress, source_size)
+    reporter = _make_progress(progress, source_size, source_path.name)
     factory = reader_factory or FileReader
     reader: Reader | None = None
     dirty_bytes = 0
@@ -313,7 +314,7 @@ def rescue(
     def report(status: str, *, force: bool = False) -> None:
         if reporter is not None:
             reporter.update(
-                current_pass=min(state.current_pass, 3),
+                current_pass=min(state.current_pass, 4),
                 pass_cursor=state.pass_cursor,
                 recovered=state.recovered_bytes,
                 skipped=state.skipped_bytes,
@@ -484,74 +485,82 @@ def rescue(
             skip_factor=skip_factor,
             grow=True,
         )
-        event("skip", f"Pass 2 probe jump {length} bytes from offset {offset}")
+        event("skip", f"Skip-retry jump {length} bytes from offset {offset}")
         return True
 
-    def run_pass2() -> None:
-        def matches(item: RecoveryRange, *, survey: bool) -> bool:
+    def sweep_skips(*, survey: bool, label: str) -> None:
+        def matches(item: RecoveryRange) -> bool:
             if item.status != "skipped":
                 return False
             is_survey = item.cause == "survey"
             return is_survey if survey else not is_survey
 
-        def sweep(*, survey: bool, label: str) -> None:
-            state.pass_cursor = 0
-            state.adaptive_skip = 0
-            event("normal", label)
-            report("normal", force=True)
-            while state.pass_cursor < source_size:
-                item = state.range_at(state.pass_cursor)
-                if item is None:
-                    break
-                if not matches(item, survey=survey):
-                    state.pass_cursor = item.end
-                    continue
-                offset = state.pass_cursor
-                probe = block_size if item.cause == "survey" else fallback_size
-                length = min(probe, item.end - offset)
-                outcome = read_once(offset, length, status="reading")
-                slow = outcome.succeeded and outcome.elapsed >= slow_threshold
-                if outcome.data is not None:
-                    write_recovered(offset, outcome.data, slow=slow)
-                    state.pass_cursor += length
-                    if slow:
-                        event(
-                            "slow",
-                            f"Slow Pass 2 probe at offset {offset}: {outcome.elapsed:.2f}s",
-                        )
-                        state.adaptive_skip = state.adaptive_skip or skip_start
-                        apply_pass2_jump()
-                        maybe_checkpoint(force=True)
-                        report("skip")
-                        continue
-                    if state.adaptive_skip:
-                        event(
-                            "normal",
-                            f"Normal region rediscovered in Pass 2 at offset {offset}",
-                        )
-                        state.adaptive_skip = 0
-                else:
-                    zero_unreadable(offset, length)
-                    state.pass_cursor += length
+        state.pass_cursor = 0
+        state.adaptive_skip = 0
+        event("normal", label)
+        report("normal", force=True)
+        while state.pass_cursor < source_size:
+            item = state.range_at(state.pass_cursor)
+            if item is None:
+                break
+            if not matches(item):
+                state.pass_cursor = item.end
+                continue
+            offset = state.pass_cursor
+            probe = block_size if item.cause == "survey" else fallback_size
+            length = min(probe, item.end - offset)
+            outcome = read_once(offset, length, status="reading")
+            slow = outcome.succeeded and outcome.elapsed >= slow_threshold
+            if outcome.data is not None:
+                write_recovered(offset, outcome.data, slow=slow)
+                state.pass_cursor += length
+                if slow:
                     event(
-                        "error",
-                        f"Pass 2 probe failure at offset {offset}: {outcome.failure}",
+                        "slow",
+                        f"Slow skip-retry at offset {offset}: {outcome.elapsed:.2f}s",
                     )
                     state.adaptive_skip = state.adaptive_skip or skip_start
                     apply_pass2_jump()
                     maybe_checkpoint(force=True)
                     report("skip")
                     continue
-                maybe_checkpoint()
-                report("normal")
+                if state.adaptive_skip:
+                    event(
+                        "normal",
+                        f"Normal region rediscovered during skip-retry at offset {offset}",
+                    )
+                    state.adaptive_skip = 0
+            else:
+                zero_unreadable(offset, length)
+                state.pass_cursor += length
+                event(
+                    "error",
+                    f"Skip-retry failure at offset {offset}: {outcome.failure}",
+                )
+                state.adaptive_skip = state.adaptive_skip or skip_start
+                apply_pass2_jump()
+                maybe_checkpoint(force=True)
+                report("skip")
+                continue
+            maybe_checkpoint()
+            report("normal")
 
-        sweep(survey=True, label="Pass 2: filling likely-good survey gaps first")
-        sweep(survey=False, label="Pass 2: retrying slow/error skips")
+    def run_pass2() -> None:
+        sweep_skips(survey=True, label="Pass 2: filling likely-good survey gaps")
         state.current_pass = 3
         state.pass_cursor = 0
         state.adaptive_skip = 0
         checkpoint()
-        event("normal", "Pass 2 complete; Deep recovery remains optional")
+        event("normal", "Pass 2 complete; slow/error skips remain for Pass 3")
+        report("normal", force=True)
+
+    def run_pass3() -> None:
+        sweep_skips(survey=False, label="Pass 3: retrying slow/error skips")
+        state.current_pass = 4
+        state.pass_cursor = 0
+        state.adaptive_skip = 0
+        checkpoint()
+        event("normal", "Pass 3 complete; Deep recovery remains optional")
         report("normal", force=True)
 
     def recover_sectors(offset: int, length: int) -> None:
@@ -598,7 +607,7 @@ def rescue(
                 cursor += size
         return True
 
-    def run_pass3() -> None:
+    def run_pass4() -> None:
         report("normal", force=True)
         while state.pass_cursor < source_size:
             item = state.range_at(state.pass_cursor)
@@ -613,11 +622,11 @@ def rescue(
             state.pass_cursor += length
             maybe_checkpoint(force=localized)
             report("error" if localized else "normal")
-        state.current_pass = 4
+        state.current_pass = 5
         state.pass_cursor = source_size
         state.adaptive_skip = 0
         checkpoint()
-        event("complete", "Pass 3 complete")
+        event("complete", "Pass 4 complete")
         report("complete", force=True)
 
     try:
@@ -630,10 +639,12 @@ def rescue(
                 run_pass2()
             elif state.current_pass == 3:
                 run_pass3()
+            elif state.current_pass == 4:
+                run_pass4()
             else:
                 break
         checkpoint()
-        report("complete" if state.current_pass == 4 else "normal", force=True)
+        report("complete" if state.current_pass >= 5 else "normal", force=True)
         return RescueResult(
             source=source_path,
             destination=destination_path,

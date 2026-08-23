@@ -18,8 +18,9 @@ Coverage includes:
 - Fast Pass continuation over normal ranges without fallback reads
 - Slow detection, adaptive skip growth, skip-reset hysteresis, and normal-region rediscovery
 - Pass 1 optional survey stride for whole-file sampling
-- Pass 2 reads limited to ranges skipped by Pass 1
-- Optional Pass 3 localization through block, fallback, and sector sizes
+- Pass 2 fills likely-good survey skips; Pass 3 retries remaining slow/error skips
+- Optional Pass 4 localization through block, fallback, and sector sizes
+- `flvrescue status` occupancy rendering from a saved map
 - Range splitting, merging, and zero-filling of final unreadable units
 - Ctrl+C checkpointing and resume without rereading recovered ranges
 - Safe migration of v1 prefix maps to the v2 range map

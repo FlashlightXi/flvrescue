@@ -23,8 +23,9 @@ If the operation is interrupted, run the same command again. The saved map is va
 ## Main features
 
 - Fast Pass with timed reads, probes, and adaptive skipping
-- Pass 2 recovery limited to ranges skipped by the Fast Pass
-- Optional Pass 3 localization from 8 MiB to 64 KiB and 4 KiB
+- Pass 2 fills likely-good (survey) skips; Pass 3 retries slow/error skips
+- Optional Pass 4 localization from 8 MiB to 64 KiB and 4 KiB
+- `flvrescue status` occupancy view that does not read the source drive
 - One source read at a time; no parallel reads against the failing disk
 - Range-based atomic JSON map with v1 map migration
 - Ctrl+C checkpointing and resumable partial output
@@ -42,7 +43,7 @@ flvrescue damaged.flv rescued.flv --block 8M --fallback 64K --sector 4K
 
 # Stop after the fastest pass, or opt into deep recovery
 flvrescue damaged.flv rescued.flv --max-pass 1
-flvrescue damaged.flv rescued.flv --max-pass 3
+flvrescue damaged.flv rescued.flv --max-pass 4
 
 # Tune slow detection and adaptive skipping
 flvrescue damaged.flv rescued.flv --slow-threshold 2 --skip-start 8M --skip-max 1G
@@ -50,16 +51,17 @@ flvrescue damaged.flv rescued.flv --slow-threshold 2 --skip-start 8M --skip-max 
 # Coarse whole-file Pass 1 (K/M/G/T suffixes, 1024-based)
 flvrescue damaged.flv rescued.flv --max-pass 1 --survey-stride 128M --skip-start 128M --skip-factor 2 --skip-reset-after 8
 
-# Disable periodic progress output
-flvrescue damaged.flv rescued.flv --no-progress
+# Inspect a map without touching the failing drive
+flvrescue status rescued.flv
 ```
 
 The default recovery flow is:
 
 ```text
 Pass 1: sample the file; keep fast data; mark likely-good vs slow/error skips
-Pass 2: fill likely-good gaps first, then retry slow/error skips
-Pass 3: optional 8 MiB -> 64 KiB -> 4 KiB deep localization
+Pass 2: fill likely-good (fast) skips
+Pass 3: retry slow/error skips
+Pass 4: optional 8 MiB -> 64 KiB -> 4 KiB deep localization
 ```
 
 ## Documentation

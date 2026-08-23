@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 import pytest
 
-from flvrescue.cli import build_parser, parse_positive_int, parse_size
+from flvrescue.cli import build_parser, main, parse_positive_int, parse_size
 
 
 @pytest.mark.parametrize(
@@ -61,3 +62,44 @@ def test_parser_exposes_survey_and_skip_growth_options() -> None:
 def test_parse_positive_int_rejects_zero() -> None:
     with pytest.raises(argparse.ArgumentTypeError):
         parse_positive_int("0")
+
+
+def test_status_command_renders_map_without_source_reads(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = tmp_path / "clip.flv"
+    destination = tmp_path / "rescued.flv"
+    source.write_bytes(b"FLV\x01" + b"abcdefgh" * 16)
+    destination.write_bytes(source.read_bytes())
+    (tmp_path / "rescued.flv.rescue.json").write_text(
+        """
+{
+  "version": 2,
+  "source_path": "%s",
+  "source_size": 128,
+  "destination_path": "%s",
+  "current_pass": 2,
+  "pass_cursor": 0,
+  "adaptive_skip": 0,
+  "ranges": [
+    {"offset": 0, "length": 32, "status": "recovered"},
+    {"offset": 32, "length": 32, "status": "skipped", "cause": "survey"},
+    {"offset": 64, "length": 32, "status": "skipped", "cause": "slow"},
+    {"offset": 96, "length": 32, "status": "unreadable", "cause": "read_error"}
+  ]
+}
+"""
+        % (source.as_posix(), destination.as_posix()),
+        encoding="utf-8",
+    )
+    assert main(["status", str(destination)]) == 0
+    output = capsys.readouterr().out
+    assert "FLVRESCUE status clip.flv" in output
+    assert "good " in output
+    assert "fast " in output
+    assert "slow " in output
+    assert "bad " in output
+    assert "map " in output
+    assert main(["analyze", str(tmp_path / "rescued.flv.rescue.json")]) == 0
+    again = capsys.readouterr().out
+    assert "FLVRESCUE status clip.flv" in again

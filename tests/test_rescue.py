@@ -138,13 +138,13 @@ def test_pass2_reads_only_ranges_skipped_by_pass1(tmp_path: Path) -> None:
         destination,
         map_path=map_path,
         reader=second_reader,
-        max_pass=2,
+        max_pass=3,
     )
 
     assert second_reader.calls == [(32, 8), (40, 8), (48, 8), (56, 8)]
     assert destination.read_bytes() == payload
     assert result.skipped_bytes == 0
-    assert result.current_pass == 3
+    assert result.current_pass == 4
 
 
 def test_pass3_is_optional_and_localizes_unreadable_block(tmp_path: Path) -> None:
@@ -171,13 +171,13 @@ def test_pass3_is_optional_and_localizes_unreadable_block(tmp_path: Path) -> Non
         destination,
         map_path=map_path,
         reader=deep_reader,
-        max_pass=3,
+        max_pass=4,
     )
     expected = bytearray(payload)
     expected[10:12] = b"\0\0"
     assert destination.read_bytes() == bytes(expected)
     assert [(item.offset, item.length) for item in after_deep.bad_ranges] == [(10, 2)]
-    assert after_deep.current_pass == 4
+    assert after_deep.current_pass == 5
 
 
 def test_resume_does_not_reread_committed_recovered_range(tmp_path: Path) -> None:
@@ -256,7 +256,7 @@ def test_progress_updates_while_reader_is_blocked(tmp_path: Path) -> None:
     source.write_bytes(payload)
     reader = SlowInjectingReader(payload, [(0, 64)], delay=0.08)
     stream = io.StringIO()
-    reporter = ProgressReporter(len(payload), stream=stream, update_interval=0.02)
+    reporter = ProgressReporter(len(payload), label="source.flv", stream=stream, update_interval=0.02)
 
     rescue(
         source,
@@ -273,9 +273,9 @@ def test_progress_updates_while_reader_is_blocked(tmp_path: Path) -> None:
         max_pass=1,
     )
 
-    lines = [line for line in stream.getvalue().splitlines() if "Pass 1" in line]
+    lines = [line for line in stream.getvalue().splitlines() if "FLVRESCUE" in line]
     assert len(lines) >= 2
-    assert any("reading" in line for line in lines)
+    assert any("source.flv" in line for line in lines)
 
 
 def test_rejects_malformed_map_and_source_destination_aliases(tmp_path: Path) -> None:
@@ -391,8 +391,22 @@ def test_pass2_fills_survey_gaps_before_slow_skips(tmp_path: Path) -> None:
     )
 
     assert second_reader.calls[0] == (128, 32)
-    hard_index = next(index for index, call in enumerate(second_reader.calls) if call[0] == 32)
-    assert hard_index > 0
-    assert second_reader.calls[hard_index] == (32, 8)
+    assert all(call[0] != 32 for call in second_reader.calls)
     assert result.easy_skipped_bytes == 0
+    assert result.hard_skipped_bytes == 32
+    hard = next(item for item in result.ranges if item.status == "skipped")
+    assert hard.offset == 32
+    assert hard.cause == "slow"
+
+    third_reader = FaultInjectingReader(payload)
+    filled = run_rescue(
+        source,
+        destination,
+        map_path=map_path,
+        reader=third_reader,
+        max_pass=3,
+        survey_stride=32,
+    )
+    assert third_reader.calls[0] == (32, 8)
+    assert filled.hard_skipped_bytes == 0
     assert destination.read_bytes() == payload

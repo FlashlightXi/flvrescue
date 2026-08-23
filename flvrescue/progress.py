@@ -10,8 +10,9 @@ import time
 from dataclasses import dataclass, replace
 from typing import Callable, TextIO
 
+from .display import format_live_lines, tally_kinds
 
-PASS_NAMES = {1: "Fast rescue", 2: "Skipped recovery", 3: "Deep recovery", 4: "Complete"}
+
 COLORS = {
     "normal": "\x1b[32m",
     "reading": "\x1b[36m",
@@ -21,34 +22,6 @@ COLORS = {
     "complete": "\x1b[32m",
 }
 RESET = "\x1b[0m"
-MAP_LEGEND = "# recovered  ~ slow-ok  . likely-good skip  ! slow/error skip  x unread  ? pending  * reading"
-GLYPH_KIND = {
-    "#": "normal",
-    "~": "slow",
-    ".": "reading",
-    "!": "skip",
-    "x": "error",
-    "?": "skip",
-    "*": "reading",
-}
-CLASS_GLYPH = {
-    "recovered": "#",
-    "recovered_slow": "~",
-    "survey": ".",
-    "hard_skip": "!",
-    "unreadable": "x",
-    "unprocessed": "?",
-    "reading": "*",
-}
-CLASS_PRIORITY = {
-    "unprocessed": 0,
-    "survey": 1,
-    "recovered": 2,
-    "recovered_slow": 3,
-    "hard_skip": 4,
-    "unreadable": 5,
-    "reading": 6,
-}
 
 
 def _enable_ansi(stream: TextIO) -> bool:
@@ -66,74 +39,6 @@ def _enable_ansi(stream: TextIO) -> bool:
         return bool(kernel32.SetConsoleMode(handle, mode.value | 0x0004))
     except (AttributeError, OSError, ValueError):
         return False
-
-
-def format_bytes(value: int) -> str:
-    value = max(0, value)
-    units = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
-    amount = float(value)
-    for unit in units:
-        if amount < 1024 or unit == units[-1]:
-            if unit == "B":
-                return f"{int(amount)} {unit}"
-            return f"{amount:.1f} {unit}"
-        amount /= 1024
-    return f"{amount:.1f} PiB"
-
-
-def format_elapsed(seconds: float) -> str:
-    seconds = max(0, int(seconds))
-    hours, remainder = divmod(seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    if hours:
-        return f"{hours}:{minutes:02}:{seconds:02}"
-    return f"{minutes}:{seconds:02}"
-
-
-def classify_span(status: str, cause: str | None) -> str:
-    if status == "recovered":
-        return "recovered_slow" if cause == "slow" else "recovered"
-    if status == "skipped":
-        return "survey" if cause == "survey" else "hard_skip"
-    if status == "unreadable":
-        return "unreadable"
-    return "unprocessed"
-
-
-def render_file_map(
-    ranges: tuple[tuple[int, int, str, str | None], ...],
-    total: int,
-    *,
-    width: int,
-    read_offset: int | None = None,
-) -> str:
-    """Render a 0%→100% occupancy map using one glyph per cell."""
-
-    columns = max(8, width)
-    if total <= 0:
-        return "?" * columns
-    cells = ["?"] * columns
-    for index in range(columns):
-        start = index * total // columns
-        end = (index + 1) * total // columns
-        if end <= start:
-            end = start + 1
-        if read_offset is not None and start <= read_offset < end:
-            cells[index] = "*"
-            continue
-        tallies: dict[str, int] = {}
-        for offset, length, status, cause in ranges:
-            span_end = offset + length
-            overlap = min(end, span_end) - max(start, offset)
-            if overlap <= 0:
-                continue
-            kind = classify_span(status, cause)
-            tallies[kind] = tallies.get(kind, 0) + overlap
-        if not tallies:
-            continue
-        winner = max(tallies, key=lambda kind: (tallies[kind], CLASS_PRIORITY[kind]))
-        cells[index] = CLASS_GLYPH[winner]
-    return "".join(cells)
 
 
 @dataclass(frozen=True)
@@ -161,6 +66,7 @@ class ProgressReporter:
         self,
         total: int,
         *,
+        label: str = "file",
         stream: TextIO | None = None,
         update_interval: float = 1.0,
         clock: Callable[[], float] = time.monotonic,
@@ -170,6 +76,7 @@ class ProgressReporter:
         if update_interval <= 0:
             raise ValueError("update_interval must be greater than zero")
         self.total = total
+        self.label = label
         self.stream = stream if stream is not None else sys.stderr
         self.update_interval = update_interval
         self._clock = clock
@@ -262,11 +169,6 @@ class ProgressReporter:
             return text
         return f"{COLORS.get(kind, '')}{text}{RESET}"
 
-    def _color_map(self, glyphs: str) -> str:
-        if not self._tty:
-            return glyphs
-        return "".join(self._color(char, GLYPH_KIND.get(char, "normal")) for char in glyphs)
-
     def _truncate(self, text: str) -> str:
         width = max(40, shutil.get_terminal_size(fallback=(100, 24)).columns)
         if len(text) <= width:
@@ -275,41 +177,23 @@ class ProgressReporter:
 
     def _lines(self, snapshot: ProgressSnapshot, now: float) -> list[str]:
         elapsed = max(now - self._started_at, 0.0)
-        percentage = 100.0 if snapshot.total == 0 else snapshot.pass_cursor / snapshot.total * 100
-        first = self._truncate(
-            f"Pass {snapshot.current_pass} {PASS_NAMES.get(snapshot.current_pass, '')} | "
-            f"Elapsed {format_elapsed(elapsed)} | Progress {percentage:5.1f}% | {snapshot.status}"
-        )
-        second = self._truncate(
-            f"Speed {format_bytes(int(self._speed))}/s | Recovered {format_bytes(snapshot.recovered)} "
-            f"| Likely-good skip {format_bytes(snapshot.easy_skipped)} "
-            f"| Slow/error skip {format_bytes(snapshot.hard_skipped)} "
-            f"| Unreadable {format_bytes(snapshot.unreadable)}"
-        )
+        counts = tally_kinds(snapshot.ranges, snapshot.total)
+        if snapshot.ranges or snapshot.recovered or snapshot.easy_skipped:
+            counts["good"] = snapshot.recovered
+            counts["fast"] = snapshot.easy_skipped
+            counts["slow"] = snapshot.hard_skipped
+            counts["bad"] = snapshot.unreadable
+            counted = counts["good"] + counts["fast"] + counts["slow"] + counts["bad"]
+            counts["pending"] = max(0, snapshot.total - counted)
         width = max(40, shutil.get_terminal_size(fallback=(100, 24)).columns)
-        glyphs = render_file_map(
-            snapshot.ranges,
-            snapshot.total,
-            width=max(8, width - 8),
-            read_offset=snapshot.read_offset,
+        return format_live_lines(
+            name=self.label,
+            total=snapshot.total,
+            counts=counts,
+            elapsed=elapsed,
+            width=width,
+            color=self._tty,
         )
-        mapped = f"0% {self._color_map(glyphs)} 100%"
-        if snapshot.read_offset is None or snapshot.read_started_at is None:
-            fourth = "Read: idle"
-        else:
-            waiting = max(0.0, now - snapshot.read_started_at)
-            fourth = self._truncate(
-                f"Read: offset {snapshot.read_offset} + {format_bytes(snapshot.read_size)} "
-                f"| waiting {waiting:.1f}s"
-            )
-        kind = snapshot.status if snapshot.status in COLORS else "normal"
-        return [
-            self._color(first, kind),
-            mapped,
-            self._truncate(MAP_LEGEND),
-            second,
-            fourth,
-        ]
 
     def _render(self, *, final: bool = False) -> None:
         now = self._clock()
@@ -334,10 +218,7 @@ class ProgressReporter:
         else:
             for kind, message in events:
                 self.stream.write(f"[{kind}] {message}\n")
-            line = self._lines(snapshot, now)[0]
-            mapped = self._lines(snapshot, now)[1]
-            detail = self._lines(snapshot, now)[3]
-            self.stream.write(f"{line} | {detail}\n{mapped}\n")
+            self.stream.write("\n".join(self._lines(snapshot, now)) + "\n")
         self.stream.flush()
 
     def _render_loop(self) -> None:
