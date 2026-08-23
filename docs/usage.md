@@ -97,7 +97,13 @@ good 1.7 GiB fast 10.5 GiB slow 7.3 GiB bad 332.4 MiB
 
 Labels on the third line are gray; the numbers use the same colors as the bar.
 
-Pass 1 scans. Pass 2 fills blue likely-good skips. Pass 3 retries yellow slow/error skips. Pass 4 is optional deep recovery.
+Pass 1 scans. Pass 2 fills each likely-good (blue) hole independently; if one hole is slow or unreadable, the rest of that hole is marked slow and the next blue hole is still filled. Pass 3 retries yellow slow/error skips. Pass 4 is optional deep recovery.
+
+After a run, remaining holes are overlaid with skippable FLV script tags so a demuxer can walk past them. This does not recover missing pictures; it only keeps the container parseable. To apply that overlay to an existing output without touching the source drive:
+
+```powershell
+flvrescue seal rescued.flv
+```
 
 To see the file in offset order, filling almost the whole terminal:
 

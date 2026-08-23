@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
 import sys
@@ -10,6 +11,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from .display import format_bytes, format_status_view, tally_kinds
+from .flvfill import overlay_map_holes
 from .mapfile import MapValidationError, load_map
 from .rescue import (
     DEFAULT_BLOCK_SIZE,
@@ -81,7 +83,8 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         epilog=(
             "Inspect a saved map without reading the source drive: "
-            "flvrescue status FILE"
+            "flvrescue status FILE. "
+            "Write skippable FLV tags over remaining holes: flvrescue seal FILE."
         ),
     )
     parser.add_argument("source", help="read-only source file on the failing drive")
@@ -241,6 +244,45 @@ def run_status(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
+def build_seal_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="flvrescue seal",
+        description=(
+            "Write skippable FLV script tags over remaining holes without "
+            "reading the source drive."
+        ),
+    )
+    parser.add_argument("path", help="rescue destination or .rescue.json map")
+    parser.add_argument("--map", dest="map_path", help="explicit resume map path")
+    return parser
+
+
+def run_seal(argv: Sequence[str] | None = None) -> int:
+    parser = build_seal_parser()
+    args = parser.parse_args(argv)
+    try:
+        map_path = resolve_map_path(
+            Path(args.path),
+            explicit=Path(args.map_path) if args.map_path else None,
+        )
+        state = load_map(map_path)
+        destination = Path(state.destination_path)
+        if not destination.is_file():
+            destination = Path(args.path).expanduser().resolve()
+        if not destination.is_file():
+            raise FileNotFoundError(f"rescue output not found: {destination}")
+        with destination.open("r+b") as handle:
+            covered = overlay_map_holes(handle, state.ranges)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except (OSError, MapValidationError) as exc:
+        print(f"flvrescue: error: {exc}", file=sys.stderr)
+        return 1
+    print(f"Sealed {format_bytes(covered)} of remaining holes with skippable FLV tags.")
+    print("This does not recover missing media; later passes can still overwrite those ranges.")
+    return 0
+
+
 def _print_summary(result: RescueResult) -> None:
     print("\nRescue run completed.")
     print(f"Target:           {result.destination}")
@@ -258,6 +300,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     argv_list = list(sys.argv[1:] if argv is None else argv)
     if argv_list and argv_list[0] in {"status", "analyze"}:
         return run_status(argv_list[1:])
+    if argv_list and argv_list[0] == "seal":
+        return run_seal(argv_list[1:])
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.block < args.fallback or args.fallback < args.sector:

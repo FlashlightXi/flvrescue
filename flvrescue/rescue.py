@@ -9,6 +9,7 @@ from os import PathLike
 from pathlib import Path
 from typing import Callable, Protocol
 
+from .flvfill import overlay_map_holes
 from .mapfile import MapValidationError, RecoveryRange, RescueMap, load_map, save_map_atomic
 from .progress import ProgressReporter
 from .reader import FileReader, Reader
@@ -488,6 +489,21 @@ def rescue(
         event("skip", f"Skip-retry jump {length} bytes from offset {offset}")
         return True
 
+    def abandon_rest_of_skip(cause: str) -> None:
+        current = state.range_at(state.pass_cursor)
+        if current is None or current.status != "skipped":
+            return
+        length = current.end - state.pass_cursor
+        if length <= 0:
+            return
+        offset = state.pass_cursor
+        state.replace_range(offset, length, "skipped", cause)
+        state.pass_cursor = current.end
+        event(
+            "skip",
+            f"Leaving remaining {length} bytes of this gap as {cause} at offset {offset}",
+        )
+
     def sweep_skips(*, survey: bool, label: str) -> None:
         def matches(item: RecoveryRange) -> bool:
             if item.status != "skipped":
@@ -519,8 +535,11 @@ def rescue(
                         "slow",
                         f"Slow skip-retry at offset {offset}: {outcome.elapsed:.2f}s",
                     )
-                    state.adaptive_skip = state.adaptive_skip or skip_start
-                    apply_pass2_jump()
+                    if survey:
+                        abandon_rest_of_skip("slow")
+                    else:
+                        state.adaptive_skip = state.adaptive_skip or skip_start
+                        apply_pass2_jump()
                     maybe_checkpoint(force=True)
                     report("skip")
                     continue
@@ -537,8 +556,11 @@ def rescue(
                     "error",
                     f"Skip-retry failure at offset {offset}: {outcome.failure}",
                 )
-                state.adaptive_skip = state.adaptive_skip or skip_start
-                apply_pass2_jump()
+                if survey:
+                    abandon_rest_of_skip("read_error")
+                else:
+                    state.adaptive_skip = state.adaptive_skip or skip_start
+                    apply_pass2_jump()
                 maybe_checkpoint(force=True)
                 report("skip")
                 continue
@@ -632,6 +654,8 @@ def rescue(
     try:
         reader = factory(source_path)
         report("starting", force=True)
+        if state.easy_skipped_bytes > 0 and max_pass >= 2 and state.current_pass > 2:
+            state.current_pass = 2
         while state.current_pass <= max_pass:
             if state.current_pass == 1:
                 run_pass1()
@@ -643,6 +667,7 @@ def rescue(
                 run_pass4()
             else:
                 break
+        overlay_map_holes(destination_handle, state.ranges)
         checkpoint()
         report("complete" if state.current_pass >= 5 else "normal", force=True)
         return RescueResult(
@@ -654,6 +679,7 @@ def rescue(
             ranges=tuple(state.ranges),
         )
     except KeyboardInterrupt:
+        overlay_map_holes(destination_handle, state.ranges)
         checkpoint()
         event("error", "Interrupted; destination and map checkpointed")
         report("error", force=True)

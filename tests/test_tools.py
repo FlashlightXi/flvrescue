@@ -83,9 +83,9 @@ def test_fault_injected_rescue_flv_is_accepted_by_ffmpeg(tmp_path: Path) -> None
     )
 
     rescued = destination.read_bytes()
-    expected = bytearray(payload)
-    expected[bad_offset : bad_offset + sector_size] = b"\0" * sector_size
-    assert rescued == bytes(expected)
+    assert rescued[:bad_offset] == payload[:bad_offset]
+    assert rescued[bad_offset + sector_size :] == payload[bad_offset + sector_size :]
+    assert rescued[bad_offset] == 0x12
     result = subprocess.run(
         [
             "ffmpeg",

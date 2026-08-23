@@ -410,3 +410,77 @@ def test_pass2_fills_survey_gaps_before_slow_skips(tmp_path: Path) -> None:
     assert third_reader.calls[0] == (32, 8)
     assert filled.hard_skipped_bytes == 0
     assert destination.read_bytes() == payload
+
+
+def test_pass2_fills_later_survey_holes_after_a_slow_survey_gap(tmp_path: Path) -> None:
+    source = tmp_path / "source.flv"
+    destination = tmp_path / "rescued.flv"
+    map_path = tmp_path / "rescued.map.json"
+    payload = patterned_bytes(256)
+    source.write_bytes(payload)
+    first_reader = FaultInjectingReader(payload)
+    run_rescue(
+        source,
+        destination,
+        map_path=map_path,
+        reader=first_reader,
+        max_pass=1,
+        survey_stride=64,
+    )
+
+    second_reader = SlowInjectingReader(payload, [(32, 32)], delay=0.02)
+    result = run_rescue(
+        source,
+        destination,
+        map_path=map_path,
+        reader=second_reader,
+        max_pass=2,
+        survey_stride=64,
+        slow_threshold=0.01,
+    )
+
+    offsets = [offset for offset, _size in second_reader.calls]
+    assert 32 in offsets
+    assert 128 in offsets
+    assert 224 in offsets
+    skipped = [
+        (item.offset, item.length, item.cause)
+        for item in result.ranges
+        if item.status == "skipped"
+    ]
+    assert skipped == [(64, 32, "slow")]
+    assert result.easy_skipped_bytes == 0
+    assert destination.read_bytes()[128:192] == payload[128:192]
+    assert destination.read_bytes()[224:] == payload[224:]
+
+
+def test_resume_reruns_pass2_when_survey_gaps_remain(tmp_path: Path) -> None:
+    source = tmp_path / "source.flv"
+    destination = tmp_path / "rescued.flv"
+    map_path = tmp_path / "rescued.map.json"
+    payload = patterned_bytes(256)
+    source.write_bytes(payload)
+    run_rescue(
+        source,
+        destination,
+        map_path=map_path,
+        reader=FaultInjectingReader(payload),
+        max_pass=1,
+        survey_stride=64,
+    )
+    map_data = read_map(map_path)
+    map_data["current_pass"] = 3
+    map_path.write_text(json.dumps(map_data), encoding="utf-8")
+
+    reader = FaultInjectingReader(payload)
+    result = run_rescue(
+        source,
+        destination,
+        map_path=map_path,
+        reader=reader,
+        max_pass=2,
+        survey_stride=64,
+    )
+    assert reader.calls
+    assert result.easy_skipped_bytes == 0
+    assert result.current_pass == 3
