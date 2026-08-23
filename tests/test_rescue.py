@@ -33,21 +33,26 @@ def run_rescue(
     reader: FaultInjectingReader | None = None,
     max_pass: int = 2,
     progress: object = False,
+    **kwargs,
 ):
+    options = {
+        "block_size": BLOCK,
+        "fallback_size": FALLBACK,
+        "sector_size": SECTOR,
+        "checkpoint_interval": BLOCK,
+        "slow_threshold": 0.01,
+        "skip_start": BLOCK,
+        "skip_max": BLOCK * 4,
+        "max_pass": max_pass,
+    }
+    options.update(kwargs)
     return rescue(
         source,
         destination,
         map_path=map_path,
         reader_factory=(lambda _source: reader) if reader is not None else None,
         progress=progress,
-        block_size=BLOCK,
-        fallback_size=FALLBACK,
-        sector_size=SECTOR,
-        checkpoint_interval=BLOCK,
-        slow_threshold=0.01,
-        skip_start=BLOCK,
-        skip_max=BLOCK * 4,
-        max_pass=max_pass,
+        **options,
     )
 
 
@@ -289,3 +294,71 @@ def test_rejects_malformed_map_and_source_destination_aliases(tmp_path: Path) ->
         run_rescue(source, destination, map_path=source)
     with pytest.raises(ValueError):
         run_rescue(source, destination, map_path=destination)
+
+
+def test_skip_factor_quadruples_width_after_consecutive_slow_reads(tmp_path: Path) -> None:
+    source = tmp_path / "source.flv"
+    destination = tmp_path / "rescued.flv"
+    payload = patterned_bytes(256)
+    source.write_bytes(payload)
+    reader = SlowInjectingReader(payload, [(0, 32), (64, 32)], delay=0.02)
+
+    result = run_rescue(
+        source,
+        destination,
+        reader=reader,
+        max_pass=1,
+        skip_factor=4,
+        skip_max=BLOCK * 16,
+    )
+
+    offsets = [offset for offset, size in reader.calls if size == BLOCK]
+    assert offsets[:3] == [0, 64, 224]
+    skipped = [(item.offset, item.length) for item in result.ranges if item.status == "skipped"]
+    assert skipped == [(32, 32), (96, 128)]
+
+
+def test_skip_reset_after_keeps_skip_mode_until_consecutive_fast_reads(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.flv"
+    destination = tmp_path / "rescued.flv"
+    payload = patterned_bytes(256)
+    source.write_bytes(payload)
+    reader = SlowInjectingReader(payload, [(0, 32)], delay=0.02)
+
+    result = run_rescue(
+        source,
+        destination,
+        reader=reader,
+        max_pass=1,
+        skip_reset_after=2,
+    )
+
+    offsets = [offset for offset, size in reader.calls if size == BLOCK]
+    assert 32 not in offsets
+    assert 96 not in offsets
+    skipped = [(item.offset, item.length, item.cause) for item in result.ranges if item.status == "skipped"]
+    assert skipped == [(32, 32, "slow"), (96, 64, "probe")]
+    assert destination.read_bytes()[160:] == payload[160:]
+
+
+def test_survey_stride_samples_the_file_during_pass1(tmp_path: Path) -> None:
+    source = tmp_path / "source.flv"
+    destination = tmp_path / "rescued.flv"
+    payload = patterned_bytes(256)
+    source.write_bytes(payload)
+    reader = FaultInjectingReader(payload)
+
+    result = run_rescue(
+        source,
+        destination,
+        reader=reader,
+        max_pass=1,
+        survey_stride=64,
+    )
+
+    assert reader.calls == [(0, BLOCK), (96, BLOCK), (192, BLOCK)]
+    skipped = [(item.offset, item.length, item.cause) for item in result.ranges if item.status == "skipped"]
+    assert skipped == [(32, 64, "survey"), (128, 64, "survey"), (224, 32, "survey")]
+    assert result.recovered_bytes == 96

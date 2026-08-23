@@ -41,12 +41,15 @@ Do not edit the JSON map manually. A malformed or mismatched map is rejected. Th
 | `--fallback SIZE` | `64K` | Read size after a normal-block error |
 | `--sector SIZE` | `4K` | Final read and zero-fill unit |
 | `--slow-threshold SECONDS` | `2.0` | Successful read duration treated as slow |
-| `--skip-start SIZE` | `8M` | Initial adaptive skip width |
+| `--skip-start SIZE` | `8M` | Initial adaptive skip width after a slow or failed read |
+| `--skip-factor N` | `2` | Multiply skip width after each slow/error |
 | `--skip-max SIZE` | `1G` | Maximum adaptive skip width |
+| `--skip-reset-after N` | `1` | Consecutive fast reads required before leaving skip mode |
+| `--survey-stride SIZE` | `0` | Pass 1 whole-file sample skip after each fast read; `0` disables |
 | `--max-pass {1,2,3}` | `2` | Last pass to execute; Pass 3 is optional deep recovery |
 | `--no-progress` | off | Suppress periodic progress output |
 
-Sizes accept byte counts or `K`, `M`, and `G` suffixes. The values must satisfy:
+Sizes accept byte counts or `K`, `M`, `G`, and `T` suffixes (1024-based). `8M`, `128MiB`, `64K`, and `1G` are valid. The read sizes must satisfy:
 
 ```text
 block >= fallback >= sector > 0
@@ -63,6 +66,16 @@ flvrescue damaged.flv rescued.flv `
   --sector 4K `
   --slow-threshold 2 `
   --max-pass 2
+
+# Coarse Pass 1: sample the file, grow skips quickly, stay in skip mode
+# until several fast reads in a row
+flvrescue damaged.flv rescued.flv `
+  --max-pass 1 `
+  --survey-stride 128M `
+  --skip-start 128M `
+  --skip-factor 2 `
+  --skip-max 1G `
+  --skip-reset-after 8
 ```
 
 Run `flvrescue --help` for the installed version's complete CLI syntax.
@@ -101,7 +114,7 @@ def read_at(offset: int, size: int) -> bytes:
     ...
 ```
 
-This is used by the test suite to raise controlled `OSError` instances or delay selected reads without touching a damaged drive. Pass limits, slow threshold, skip bounds, read sizes, checkpoint interval, and a custom progress sink can also be supplied.
+This is used by the test suite to raise controlled `OSError` instances or delay selected reads without touching a damaged drive. Pass limits, slow threshold, skip start/factor/max, skip-reset-after, survey stride, read sizes, checkpoint interval, and a custom progress sink can also be supplied.
 
 Library calls checkpoint and then re-raise `KeyboardInterrupt`. The CLI catches that interruption, prints a resume message, and exits without a traceback.
 
