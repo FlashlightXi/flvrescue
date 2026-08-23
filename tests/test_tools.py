@@ -79,7 +79,7 @@ def test_fault_injected_rescue_flv_is_accepted_by_ffmpeg(tmp_path: Path) -> None
         block_size=2048,
         fallback_size=128,
         sector_size=sector_size,
-        max_pass=3,
+        max_pass=4,
     )
 
     rescued = destination.read_bytes()

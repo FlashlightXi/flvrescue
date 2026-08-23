@@ -2,7 +2,7 @@
 
 ## What flvrescue does
 
-`flvrescue` reads one ordinary file with one source request at a time and writes the result to a different file. The Fast Pass skips ahead after slow or failed reads, Pass 2 revisits only skipped ranges, and optional Pass 3 narrows unresolved ranges to smaller reads. Unrecovered ranges remain zero-filled so later readable data keeps its original offset.
+`flvrescue` reads one ordinary file with one source request at a time and writes the result to a different file. The Fast Pass skips ahead after slow or failed reads, Pass 2 revisits likely-good survey skips, Pass 3 retries slow or error skips, and optional Pass 4 narrows unresolved ranges to smaller reads. Unrecovered ranges remain zero-filled so later readable data keeps its original offset.
 
 The source file is never opened for writing.
 

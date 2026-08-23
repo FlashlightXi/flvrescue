@@ -10,8 +10,9 @@ import time
 from dataclasses import dataclass, replace
 from typing import Callable, TextIO
 
+from .display import format_live_lines, tally_kinds
 
-PASS_NAMES = {1: "Fast rescue", 2: "Skipped recovery", 3: "Deep recovery", 4: "Complete"}
+
 COLORS = {
     "normal": "\x1b[32m",
     "reading": "\x1b[36m",
@@ -40,28 +41,6 @@ def _enable_ansi(stream: TextIO) -> bool:
         return False
 
 
-def format_bytes(value: int) -> str:
-    value = max(0, value)
-    units = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
-    amount = float(value)
-    for unit in units:
-        if amount < 1024 or unit == units[-1]:
-            if unit == "B":
-                return f"{int(amount)} {unit}"
-            return f"{amount:.1f} {unit}"
-        amount /= 1024
-    return f"{amount:.1f} PiB"
-
-
-def format_elapsed(seconds: float) -> str:
-    seconds = max(0, int(seconds))
-    hours, remainder = divmod(seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    if hours:
-        return f"{hours}:{minutes:02}:{seconds:02}"
-    return f"{minutes}:{seconds:02}"
-
-
 @dataclass(frozen=True)
 class ProgressSnapshot:
     current_pass: int = 1
@@ -71,6 +50,9 @@ class ProgressSnapshot:
     skipped: int = 0
     slow: int = 0
     unreadable: int = 0
+    easy_skipped: int = 0
+    hard_skipped: int = 0
+    ranges: tuple[tuple[int, int, str, str | None], ...] = ()
     status: str = "starting"
     read_offset: int | None = None
     read_size: int = 0
@@ -84,6 +66,7 @@ class ProgressReporter:
         self,
         total: int,
         *,
+        label: str = "file",
         stream: TextIO | None = None,
         update_interval: float = 1.0,
         clock: Callable[[], float] = time.monotonic,
@@ -93,6 +76,7 @@ class ProgressReporter:
         if update_interval <= 0:
             raise ValueError("update_interval must be greater than zero")
         self.total = total
+        self.label = label
         self.stream = stream if stream is not None else sys.stderr
         self.update_interval = update_interval
         self._clock = clock
@@ -126,6 +110,9 @@ class ProgressReporter:
         slow: int,
         unreadable: int,
         status: str,
+        easy_skipped: int = 0,
+        hard_skipped: int = 0,
+        ranges: tuple[tuple[int, int, str, str | None], ...] = (),
         force: bool = False,
     ) -> None:
         with self._lock:
@@ -137,6 +124,9 @@ class ProgressReporter:
                 skipped=skipped,
                 slow=slow,
                 unreadable=unreadable,
+                easy_skipped=easy_skipped,
+                hard_skipped=hard_skipped,
+                ranges=ranges,
                 status=status,
             )
         if force:
@@ -187,26 +177,23 @@ class ProgressReporter:
 
     def _lines(self, snapshot: ProgressSnapshot, now: float) -> list[str]:
         elapsed = max(now - self._started_at, 0.0)
-        percentage = 100.0 if snapshot.total == 0 else snapshot.pass_cursor / snapshot.total * 100
-        first = self._truncate(
-            f"Pass {snapshot.current_pass} {PASS_NAMES.get(snapshot.current_pass, '')} | "
-            f"Elapsed {format_elapsed(elapsed)} | Progress {percentage:5.1f}% | {snapshot.status}"
+        counts = tally_kinds(snapshot.ranges, snapshot.total)
+        if snapshot.ranges or snapshot.recovered or snapshot.easy_skipped:
+            counts["good"] = snapshot.recovered
+            counts["fast"] = snapshot.easy_skipped
+            counts["slow"] = snapshot.hard_skipped
+            counts["bad"] = snapshot.unreadable
+            counted = counts["good"] + counts["fast"] + counts["slow"] + counts["bad"]
+            counts["pending"] = max(0, snapshot.total - counted)
+        width = max(40, shutil.get_terminal_size(fallback=(100, 24)).columns)
+        return format_live_lines(
+            name=self.label,
+            total=snapshot.total,
+            counts=counts,
+            elapsed=elapsed,
+            width=width,
+            color=self._tty,
         )
-        slow_skipped = snapshot.slow + snapshot.skipped
-        second = self._truncate(
-            f"Speed {format_bytes(int(self._speed))}/s | Recovered {format_bytes(snapshot.recovered)} "
-            f"| Slow/Skipped {format_bytes(slow_skipped)} | Unreadable {format_bytes(snapshot.unreadable)}"
-        )
-        if snapshot.read_offset is None or snapshot.read_started_at is None:
-            third = "Read: idle"
-        else:
-            waiting = max(0.0, now - snapshot.read_started_at)
-            third = self._truncate(
-                f"Read: offset {snapshot.read_offset} + {format_bytes(snapshot.read_size)} "
-                f"| waiting {waiting:.1f}s"
-            )
-        kind = snapshot.status if snapshot.status in COLORS else "normal"
-        return [self._color(first, kind), second, third]
 
     def _render(self, *, final: bool = False) -> None:
         now = self._clock()
@@ -231,9 +218,7 @@ class ProgressReporter:
         else:
             for kind, message in events:
                 self.stream.write(f"[{kind}] {message}\n")
-            line = self._lines(snapshot, now)[0]
-            detail = self._lines(snapshot, now)[1]
-            self.stream.write(f"{line} | {detail}\n")
+            self.stream.write("\n".join(self._lines(snapshot, now)) + "\n")
         self.stream.flush()
 
     def _render_loop(self) -> None:
