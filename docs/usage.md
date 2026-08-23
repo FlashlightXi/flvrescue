@@ -46,7 +46,7 @@ Do not edit the JSON map manually. A malformed or mismatched map is rejected. Th
 | `--skip-max SIZE` | `1G` | Maximum adaptive skip width |
 | `--skip-reset-after N` | `1` | Consecutive fast reads required before leaving skip mode |
 | `--survey-stride SIZE` | `0` | Pass 1 whole-file sample skip after each fast read; `0` disables |
-| `--max-pass {1,2,3}` | `2` | Last pass to execute; Pass 3 is optional deep recovery |
+| `--max-pass {1,2,3,4}` | `2` | Last pass to execute; Pass 4 is optional deep recovery |
 | `--no-progress` | off | Suppress periodic progress output |
 
 Sizes accept byte counts or `K`, `M`, `G`, and `T` suffixes (1024-based). `8M`, `128MiB`, `64K`, and `1G` are valid. The read sizes must satisfy:
@@ -82,15 +82,31 @@ Run `flvrescue --help` for the installed version's complete CLI syntax.
 
 ## Progress and summary
 
-On a TTY, a dedicated renderer keeps a compact three-line Live display at the bottom of the terminal. Important slow, error, skip, rediscovery, and pass-change events remain visible above it. Rendering reads shared memory only and never touches the source drive.
+On a TTY, rescue uses a 3-line stacked bar, not an offset map:
 
 ```text
-Pass 1 Fast rescue | Elapsed 12:21 | Progress 78.4% | reading
-Speed 112.8 MiB/s | Recovered 78.4 GiB | Slow/Skipped 64.0 MiB | Unreadable 8.0 MiB
-Read: offset 84288733184 + 8.0 MiB | waiting 0.4s
+FLVRESCUE reads 493.flv (26.0 GiB)
+████▒▒▒▒▒▒▒              3.5 GiB 02:55
+good 1.7 GiB fast 10.5 GiB slow 7.3 GiB bad 332.4 MiB
 ```
 
-Non-TTY streams receive ordinary line-based logs. The final summary reports recovered, skipped, unreadable, and unprocessed bytes, plus the next available pass and map path.
+- `█` good / recovered (green)
+- `▒` likely-good skip (blue), then slow/error skip (yellow)
+- `░` unreadable (red)
+- space: not yet classified
+
+Labels on the third line are gray; the numbers use the same colors as the bar.
+
+Pass 1 scans. Pass 2 fills blue likely-good skips. Pass 3 retries yellow slow/error skips. Pass 4 is optional deep recovery.
+
+To see the file in offset order, filling almost the whole terminal:
+
+```powershell
+flvrescue status rescued.flv
+flvrescue status rescued.flv.rescue.json
+```
+
+That command does not read the failing drive. It only renders the map: many rows of `█▒░` from 0% to 100%, then two or three summary lines. `flvrescue analyze` is the same command. Pass the rescued file or the `.rescue.json` map; the FLV bytes themselves are not opened.
 
 ## Library API
 
