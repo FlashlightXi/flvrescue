@@ -47,6 +47,9 @@ flvrescue damaged.flv rescued.flv --max-pass 3
 # Tune slow detection and adaptive skipping
 flvrescue damaged.flv rescued.flv --slow-threshold 2 --skip-start 8M --skip-max 1G
 
+# Coarse whole-file Pass 1 (K/M/G/T suffixes, 1024-based)
+flvrescue damaged.flv rescued.flv --max-pass 1 --survey-stride 128M --skip-start 128M --skip-factor 2 --skip-reset-after 8
+
 # Disable periodic progress output
 flvrescue damaged.flv rescued.flv --no-progress
 ```

@@ -21,6 +21,9 @@ DEFAULT_CHECKPOINT_INTERVAL = 64 * 1024 * 1024
 DEFAULT_SLOW_THRESHOLD = 2.0
 DEFAULT_SKIP_START = 8 * 1024 * 1024
 DEFAULT_SKIP_MAX = 1024 * 1024 * 1024
+DEFAULT_SKIP_FACTOR = 2
+DEFAULT_SKIP_RESET_AFTER = 1
+DEFAULT_SURVEY_STRIDE = 0
 DEFAULT_MAX_PASS = 2
 
 
@@ -100,6 +103,25 @@ def _same_path(left: Path, right: Path) -> bool:
         return left.exists() and right.exists() and os.path.samefile(left, right)
     except OSError:
         return False
+
+
+def next_skip_width(
+    width: int,
+    *,
+    skip_start: int,
+    skip_max: int,
+    skip_factor: int,
+    grow: bool,
+) -> int:
+    """Return the skip width used for the next jump."""
+
+    current = width if width > 0 else skip_start
+    if grow:
+        grown = current * skip_factor
+        if grown <= current:
+            grown = current + skip_start
+        current = grown
+    return min(skip_max, max(skip_start, current))
 
 
 def _validate_sizes(block_size: int, fallback_size: int, sector_size: int) -> None:
@@ -189,6 +211,9 @@ def rescue(
     slow_threshold: float = DEFAULT_SLOW_THRESHOLD,
     skip_start: int = DEFAULT_SKIP_START,
     skip_max: int = DEFAULT_SKIP_MAX,
+    skip_factor: int = DEFAULT_SKIP_FACTOR,
+    skip_reset_after: int = DEFAULT_SKIP_RESET_AFTER,
+    survey_stride: int = DEFAULT_SURVEY_STRIDE,
     max_pass: int = DEFAULT_MAX_PASS,
     clock: Callable[[], float] = time.monotonic,
 ) -> RescueResult:
@@ -199,9 +224,13 @@ def rescue(
         "checkpoint_interval": checkpoint_interval,
         "skip_start": skip_start,
         "skip_max": skip_max,
+        "skip_factor": skip_factor,
+        "skip_reset_after": skip_reset_after,
     }.items():
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError(f"{name} must be a positive integer")
+    if isinstance(survey_stride, bool) or not isinstance(survey_stride, int) or survey_stride < 0:
+        raise ValueError("survey_stride must be a non-negative integer")
     if skip_start > skip_max:
         raise ValueError("skip_start must not exceed skip_max")
     if isinstance(slow_threshold, bool) or not isinstance(slow_threshold, (int, float)):
@@ -257,6 +286,7 @@ def rescue(
     factory = reader_factory or FileReader
     reader: Reader | None = None
     dirty_bytes = 0
+    fast_streak = 0
 
     def checkpoint() -> None:
         nonlocal dirty_bytes
@@ -325,7 +355,8 @@ def rescue(
         if force or dirty_bytes >= checkpoint_interval:
             checkpoint()
 
-    def apply_adaptive_skip(cause: str) -> bool:
+    def apply_adaptive_skip(cause: str, *, grow: bool = True) -> bool:
+        nonlocal fast_streak
         current = state.range_at(state.pass_cursor)
         if current is None or current.status != "unprocessed":
             return False
@@ -334,9 +365,49 @@ def rescue(
         offset = state.pass_cursor
         state.replace_range(offset, length, "skipped", cause)
         state.pass_cursor += length
-        state.adaptive_skip = min(skip_max, max(skip_start, width * 2))
+        state.adaptive_skip = next_skip_width(
+            width,
+            skip_start=skip_start,
+            skip_max=skip_max,
+            skip_factor=skip_factor,
+            grow=grow,
+        )
         event("skip", f"Skip {length} bytes at offset {offset}; next width {state.adaptive_skip}")
         return True
+
+    def apply_survey_skip() -> bool:
+        if survey_stride <= 0:
+            return False
+        current = state.range_at(state.pass_cursor)
+        if current is None or current.status != "unprocessed":
+            return False
+        length = min(survey_stride, current.end - state.pass_cursor)
+        if length <= 0:
+            return False
+        offset = state.pass_cursor
+        state.replace_range(offset, length, "skipped", "survey")
+        state.pass_cursor += length
+        event("skip", f"Survey skip {length} bytes at offset {offset}")
+        return True
+
+    def note_fast_read(offset: int) -> None:
+        nonlocal fast_streak
+        if state.adaptive_skip:
+            fast_streak += 1
+            if fast_streak >= skip_reset_after:
+                event("normal", f"Normal read speed rediscovered at offset {offset}")
+                state.adaptive_skip = 0
+                fast_streak = 0
+            else:
+                apply_adaptive_skip("probe", grow=False)
+            return
+        fast_streak = 0
+        apply_survey_skip()
+
+    def note_slow_or_error() -> None:
+        nonlocal fast_streak
+        fast_streak = 0
+        state.adaptive_skip = state.adaptive_skip or skip_start
 
     def run_pass1() -> None:
         state.pass_cursor = min(state.pass_cursor, source_size)
@@ -357,19 +428,17 @@ def rescue(
                 state.pass_cursor += length
                 if slow:
                     event("slow", f"Slow read at offset {offset}: {outcome.elapsed:.2f}s")
-                    state.adaptive_skip = state.adaptive_skip or skip_start
+                    note_slow_or_error()
                     apply_adaptive_skip("slow")
                     maybe_checkpoint(force=True)
                     report("skip")
                     continue
-                if state.adaptive_skip:
-                    event("normal", f"Normal read speed rediscovered at offset {offset}")
-                    state.adaptive_skip = 0
+                note_fast_read(offset)
             else:
                 zero_unreadable(offset, length)
                 state.pass_cursor += length
                 event("error", f"Block read failure at offset {offset}: {outcome.failure}")
-                state.adaptive_skip = state.adaptive_skip or skip_start
+                note_slow_or_error()
                 apply_adaptive_skip("read_error")
                 maybe_checkpoint(force=True)
                 report("skip")
@@ -391,7 +460,13 @@ def rescue(
         length = min(width, current.end - state.pass_cursor)
         offset = state.pass_cursor
         state.pass_cursor += length
-        state.adaptive_skip = min(skip_max, max(skip_start, width * 2))
+        state.adaptive_skip = next_skip_width(
+            width,
+            skip_start=skip_start,
+            skip_max=skip_max,
+            skip_factor=skip_factor,
+            grow=True,
+        )
         event("skip", f"Pass 2 probe jump {length} bytes from offset {offset}")
         return True
 
@@ -405,7 +480,8 @@ def rescue(
                 state.pass_cursor = item.end
                 continue
             offset = state.pass_cursor
-            length = min(fallback_size, item.end - offset)
+            probe = block_size if item.cause == "survey" else fallback_size
+            length = min(probe, item.end - offset)
             outcome = read_once(offset, length, status="reading")
             slow = outcome.succeeded and outcome.elapsed >= slow_threshold
             if outcome.data is not None:

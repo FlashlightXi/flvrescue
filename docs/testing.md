@@ -16,7 +16,8 @@ Coverage includes:
 - Normal byte-for-byte copy and hash equality
 - A short final normal block
 - Fast Pass continuation over normal ranges without fallback reads
-- Slow detection, adaptive skip growth, and normal-region rediscovery
+- Slow detection, adaptive skip growth, skip-reset hysteresis, and normal-region rediscovery
+- Pass 1 optional survey stride for whole-file sampling
 - Pass 2 reads limited to ranges skipped by Pass 1
 - Optional Pass 3 localization through block, fallback, and sector sizes
 - Range splitting, merging, and zero-filling of final unreadable units
