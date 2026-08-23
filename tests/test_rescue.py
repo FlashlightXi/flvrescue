@@ -362,3 +362,37 @@ def test_survey_stride_samples_the_file_during_pass1(tmp_path: Path) -> None:
     skipped = [(item.offset, item.length, item.cause) for item in result.ranges if item.status == "skipped"]
     assert skipped == [(32, 64, "survey"), (128, 64, "survey"), (224, 32, "survey")]
     assert result.recovered_bytes == 96
+
+
+def test_pass2_fills_survey_gaps_before_slow_skips(tmp_path: Path) -> None:
+    source = tmp_path / "source.flv"
+    destination = tmp_path / "rescued.flv"
+    map_path = tmp_path / "rescued.map.json"
+    payload = patterned_bytes(192)
+    source.write_bytes(payload)
+    first_reader = SlowInjectingReader(payload, [(0, 32)], delay=0.02)
+    run_rescue(
+        source,
+        destination,
+        map_path=map_path,
+        reader=first_reader,
+        max_pass=1,
+        survey_stride=32,
+    )
+
+    second_reader = FaultInjectingReader(payload)
+    result = run_rescue(
+        source,
+        destination,
+        map_path=map_path,
+        reader=second_reader,
+        max_pass=2,
+        survey_stride=32,
+    )
+
+    assert second_reader.calls[0] == (128, 32)
+    hard_index = next(index for index, call in enumerate(second_reader.calls) if call[0] == 32)
+    assert hard_index > 0
+    assert second_reader.calls[hard_index] == (32, 8)
+    assert result.easy_skipped_bytes == 0
+    assert destination.read_bytes() == payload

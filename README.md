@@ -57,9 +57,8 @@ flvrescue damaged.flv rescued.flv --no-progress
 The default recovery flow is:
 
 ```text
-Pass 1: fast read succeeds -> write it
-        slow/error         -> preserve any data, skip ahead, and probe
-Pass 2: revisit skipped ranges with smaller probes
+Pass 1: sample the file; keep fast data; mark likely-good vs slow/error skips
+Pass 2: fill likely-good gaps first, then retry slow/error skips
 Pass 3: optional 8 MiB -> 64 KiB -> 4 KiB deep localization
 ```
 

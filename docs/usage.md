@@ -82,15 +82,19 @@ Run `flvrescue --help` for the installed version's complete CLI syntax.
 
 ## Progress and summary
 
-On a TTY, a dedicated renderer keeps a compact three-line Live display at the bottom of the terminal. Important slow, error, skip, rediscovery, and pass-change events remain visible above it. Rendering reads shared memory only and never touches the source drive.
+On a TTY, a dedicated renderer keeps a compact live display at the bottom of the terminal. Important slow, error, skip, rediscovery, and pass-change events remain visible above it. Rendering reads shared memory only and never touches the source drive.
 
 ```text
 Pass 1 Fast rescue | Elapsed 12:21 | Progress 78.4% | reading
-Speed 112.8 MiB/s | Recovered 78.4 GiB | Slow/Skipped 64.0 MiB | Unreadable 8.0 MiB
+0% ##########!!!!!!!!!!!!!!...................... 100%
+# recovered  ~ slow-ok  . likely-good skip  ! slow/error skip  x unread  ? pending  * reading
+Speed 112.8 MiB/s | Recovered 78.4 GiB | Likely-good skip 12.0 GiB | Slow/error skip 64.0 MiB | Unreadable 8.0 MiB
 Read: offset 84288733184 + 8.0 MiB | waiting 0.4s
 ```
 
-Non-TTY streams receive ordinary line-based logs. The final summary reports recovered, skipped, unreadable, and unprocessed bytes, plus the next available pass and map path.
+The map spans the whole file from 0% to 100%. `.` is a survey skip (Pass 1 jumped because the last read was fast). `!` is a skip after a slow or failed read. Pass 2 fills `.` first, then retries `!`.
+
+Non-TTY streams receive ordinary line-based logs. The final summary reports recovered, likely-good skips, slow/error skips, unreadable, and unprocessed bytes, plus the next available pass and map path.
 
 ## Library API
 

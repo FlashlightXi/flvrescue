@@ -187,6 +187,14 @@ class RescueMap:
         selected = frozenset(statuses)
         return sum(item.length for item in self.ranges if item.status in selected)
 
+    def skipped_bytes_for(self, *causes: str) -> int:
+        wanted = frozenset(causes)
+        return sum(
+            item.length
+            for item in self.ranges
+            if item.status == "skipped" and (item.cause or "slow") in wanted
+        )
+
     @property
     def recovered_bytes(self) -> int:
         return self.bytes_for("recovered")
@@ -194,6 +202,14 @@ class RescueMap:
     @property
     def skipped_bytes(self) -> int:
         return self.bytes_for("skipped")
+
+    @property
+    def easy_skipped_bytes(self) -> int:
+        return self.skipped_bytes_for("survey")
+
+    @property
+    def hard_skipped_bytes(self) -> int:
+        return self.skipped_bytes - self.easy_skipped_bytes
 
     @property
     def unreadable_bytes(self) -> int:

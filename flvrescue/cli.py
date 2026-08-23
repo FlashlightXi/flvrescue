@@ -165,10 +165,11 @@ def build_parser() -> argparse.ArgumentParser:
 def _print_summary(result: RescueResult) -> None:
     print("\nRescue run completed.")
     print(f"Target:      {result.destination}")
-    print(f"Recovered:   {format_bytes(result.recovered_bytes)}")
-    print(f"Skipped:     {format_bytes(result.skipped_bytes)}")
-    print(f"Unreadable:  {format_bytes(result.unreadable_bytes)}")
-    print(f"Unprocessed: {format_bytes(result.unprocessed_bytes)}")
+    print(f"Recovered:        {format_bytes(result.recovered_bytes)}")
+    print(f"Likely-good skip: {format_bytes(result.easy_skipped_bytes)}")
+    print(f"Slow/error skip:  {format_bytes(result.hard_skipped_bytes)}")
+    print(f"Unreadable:       {format_bytes(result.unreadable_bytes)}")
+    print(f"Unprocessed:      {format_bytes(result.unprocessed_bytes)}")
     if result.current_pass <= 3:
         print(f"Next pass:   {result.current_pass}")
     print(f"Resume map:  {result.map_path}")

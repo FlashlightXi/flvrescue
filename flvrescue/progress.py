@@ -21,6 +21,34 @@ COLORS = {
     "complete": "\x1b[32m",
 }
 RESET = "\x1b[0m"
+MAP_LEGEND = "# recovered  ~ slow-ok  . likely-good skip  ! slow/error skip  x unread  ? pending  * reading"
+GLYPH_KIND = {
+    "#": "normal",
+    "~": "slow",
+    ".": "reading",
+    "!": "skip",
+    "x": "error",
+    "?": "skip",
+    "*": "reading",
+}
+CLASS_GLYPH = {
+    "recovered": "#",
+    "recovered_slow": "~",
+    "survey": ".",
+    "hard_skip": "!",
+    "unreadable": "x",
+    "unprocessed": "?",
+    "reading": "*",
+}
+CLASS_PRIORITY = {
+    "unprocessed": 0,
+    "survey": 1,
+    "recovered": 2,
+    "recovered_slow": 3,
+    "hard_skip": 4,
+    "unreadable": 5,
+    "reading": 6,
+}
 
 
 def _enable_ansi(stream: TextIO) -> bool:
@@ -62,6 +90,52 @@ def format_elapsed(seconds: float) -> str:
     return f"{minutes}:{seconds:02}"
 
 
+def classify_span(status: str, cause: str | None) -> str:
+    if status == "recovered":
+        return "recovered_slow" if cause == "slow" else "recovered"
+    if status == "skipped":
+        return "survey" if cause == "survey" else "hard_skip"
+    if status == "unreadable":
+        return "unreadable"
+    return "unprocessed"
+
+
+def render_file_map(
+    ranges: tuple[tuple[int, int, str, str | None], ...],
+    total: int,
+    *,
+    width: int,
+    read_offset: int | None = None,
+) -> str:
+    """Render a 0%→100% occupancy map using one glyph per cell."""
+
+    columns = max(8, width)
+    if total <= 0:
+        return "?" * columns
+    cells = ["?"] * columns
+    for index in range(columns):
+        start = index * total // columns
+        end = (index + 1) * total // columns
+        if end <= start:
+            end = start + 1
+        if read_offset is not None and start <= read_offset < end:
+            cells[index] = "*"
+            continue
+        tallies: dict[str, int] = {}
+        for offset, length, status, cause in ranges:
+            span_end = offset + length
+            overlap = min(end, span_end) - max(start, offset)
+            if overlap <= 0:
+                continue
+            kind = classify_span(status, cause)
+            tallies[kind] = tallies.get(kind, 0) + overlap
+        if not tallies:
+            continue
+        winner = max(tallies, key=lambda kind: (tallies[kind], CLASS_PRIORITY[kind]))
+        cells[index] = CLASS_GLYPH[winner]
+    return "".join(cells)
+
+
 @dataclass(frozen=True)
 class ProgressSnapshot:
     current_pass: int = 1
@@ -71,6 +145,9 @@ class ProgressSnapshot:
     skipped: int = 0
     slow: int = 0
     unreadable: int = 0
+    easy_skipped: int = 0
+    hard_skipped: int = 0
+    ranges: tuple[tuple[int, int, str, str | None], ...] = ()
     status: str = "starting"
     read_offset: int | None = None
     read_size: int = 0
@@ -126,6 +203,9 @@ class ProgressReporter:
         slow: int,
         unreadable: int,
         status: str,
+        easy_skipped: int = 0,
+        hard_skipped: int = 0,
+        ranges: tuple[tuple[int, int, str, str | None], ...] = (),
         force: bool = False,
     ) -> None:
         with self._lock:
@@ -137,6 +217,9 @@ class ProgressReporter:
                 skipped=skipped,
                 slow=slow,
                 unreadable=unreadable,
+                easy_skipped=easy_skipped,
+                hard_skipped=hard_skipped,
+                ranges=ranges,
                 status=status,
             )
         if force:
@@ -179,6 +262,11 @@ class ProgressReporter:
             return text
         return f"{COLORS.get(kind, '')}{text}{RESET}"
 
+    def _color_map(self, glyphs: str) -> str:
+        if not self._tty:
+            return glyphs
+        return "".join(self._color(char, GLYPH_KIND.get(char, "normal")) for char in glyphs)
+
     def _truncate(self, text: str) -> str:
         width = max(40, shutil.get_terminal_size(fallback=(100, 24)).columns)
         if len(text) <= width:
@@ -192,21 +280,36 @@ class ProgressReporter:
             f"Pass {snapshot.current_pass} {PASS_NAMES.get(snapshot.current_pass, '')} | "
             f"Elapsed {format_elapsed(elapsed)} | Progress {percentage:5.1f}% | {snapshot.status}"
         )
-        slow_skipped = snapshot.slow + snapshot.skipped
         second = self._truncate(
             f"Speed {format_bytes(int(self._speed))}/s | Recovered {format_bytes(snapshot.recovered)} "
-            f"| Slow/Skipped {format_bytes(slow_skipped)} | Unreadable {format_bytes(snapshot.unreadable)}"
+            f"| Likely-good skip {format_bytes(snapshot.easy_skipped)} "
+            f"| Slow/error skip {format_bytes(snapshot.hard_skipped)} "
+            f"| Unreadable {format_bytes(snapshot.unreadable)}"
         )
+        width = max(40, shutil.get_terminal_size(fallback=(100, 24)).columns)
+        glyphs = render_file_map(
+            snapshot.ranges,
+            snapshot.total,
+            width=max(8, width - 8),
+            read_offset=snapshot.read_offset,
+        )
+        mapped = f"0% {self._color_map(glyphs)} 100%"
         if snapshot.read_offset is None or snapshot.read_started_at is None:
-            third = "Read: idle"
+            fourth = "Read: idle"
         else:
             waiting = max(0.0, now - snapshot.read_started_at)
-            third = self._truncate(
+            fourth = self._truncate(
                 f"Read: offset {snapshot.read_offset} + {format_bytes(snapshot.read_size)} "
                 f"| waiting {waiting:.1f}s"
             )
         kind = snapshot.status if snapshot.status in COLORS else "normal"
-        return [self._color(first, kind), second, third]
+        return [
+            self._color(first, kind),
+            mapped,
+            self._truncate(MAP_LEGEND),
+            second,
+            fourth,
+        ]
 
     def _render(self, *, final: bool = False) -> None:
         now = self._clock()
@@ -232,8 +335,9 @@ class ProgressReporter:
             for kind, message in events:
                 self.stream.write(f"[{kind}] {message}\n")
             line = self._lines(snapshot, now)[0]
-            detail = self._lines(snapshot, now)[1]
-            self.stream.write(f"{line} | {detail}\n")
+            mapped = self._lines(snapshot, now)[1]
+            detail = self._lines(snapshot, now)[3]
+            self.stream.write(f"{line} | {detail}\n{mapped}\n")
         self.stream.flush()
 
     def _render_loop(self) -> None:
