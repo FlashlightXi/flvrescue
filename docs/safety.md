@@ -21,7 +21,7 @@ It is complementary to, not a replacement for, device-level recovery tools such 
 
 ## Read cancellation boundary
 
-On Windows, the default backend uses one explicit-offset overlapped `ReadFile` request at a time. Each pass has a saved per-read time budget. When the budget expires or Ctrl+C requests a stop, `flvrescue` calls `CancelIoEx` for that request and waits briefly for Windows to acknowledge completion.
+On Windows, the default backend uses one explicit-offset overlapped `ReadFile` request at a time. The call itself runs on a dedicated I/O thread so a storage driver that blocks inside `ReadFile` cannot freeze the budget wait or the first Ctrl+C handler. Each pass has a saved per-read time budget. When the budget expires or Ctrl+C requests a stop, `flvrescue` calls `CancelIoEx` and `CancelSynchronousIo` and waits briefly for Windows to acknowledge completion.
 
 Windows request cancellation is not a physical-device guarantee. A storage driver, USB bridge, or drive firmware may continue lower-level work after Windows reports cancellation. If cancellation is still pending after the grace period, `flvrescue` checkpoints and starts no further reads; it keeps the native request storage alive until process exit rather than releasing memory still owned by the kernel.
 

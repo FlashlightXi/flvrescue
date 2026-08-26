@@ -84,8 +84,11 @@ _PENDING_WINDOWS_READS: list[object] = []
 class WindowsOverlappedReader:
     """Windows read-only backend using overlapped I/O and ``CancelIoEx``.
 
-    Cancellation completes at the OS request layer; a USB bridge or drive may
-    continue lower-level activity afterwards.  If Windows does not acknowledge
+    ``ReadFile`` runs on a dedicated thread so a USB driver that blocks inside
+    the call cannot prevent the budget wait or Ctrl+C handler from running.
+    Cancellation uses both ``CancelIoEx`` and ``CancelSynchronousIo``.  It
+    completes at the OS request layer; a USB bridge or drive may continue
+    lower-level activity afterwards.  If Windows does not acknowledge
     cancellation promptly, the request storage and handle are deliberately kept
     alive until process exit rather than risking use-after-free in kernel I/O.
     """
@@ -152,8 +155,26 @@ class WindowsOverlappedReader:
         kernel32.GetOverlappedResult.restype = wintypes.BOOL
         kernel32.CancelIoEx.argtypes = [wintypes.HANDLE, ctypes.POINTER(Overlapped)]
         kernel32.CancelIoEx.restype = wintypes.BOOL
+        kernel32.CancelSynchronousIo.argtypes = [wintypes.HANDLE]
+        kernel32.CancelSynchronousIo.restype = wintypes.BOOL
+        kernel32.SetEvent.argtypes = [wintypes.HANDLE]
+        kernel32.SetEvent.restype = wintypes.BOOL
         kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
         kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.GetCurrentProcess.argtypes = []
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.GetCurrentThread.argtypes = []
+        kernel32.GetCurrentThread.restype = wintypes.HANDLE
+        kernel32.DuplicateHandle.argtypes = [
+            wintypes.HANDLE,
+            wintypes.HANDLE,
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.HANDLE),
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        ]
+        kernel32.DuplicateHandle.restype = wintypes.BOOL
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         kernel32.CloseHandle.restype = wintypes.BOOL
 
@@ -164,7 +185,7 @@ class WindowsOverlappedReader:
         self._kernel32 = kernel32
         self._cancel_grace = cancel_grace
         self._poll_interval = poll_interval
-        self._pending: tuple[object, object, object] | None = None
+        self._pending: tuple[object, object, object, object] | None = None
         self._closed = False
 
         generic_read = 0x80000000
@@ -198,22 +219,39 @@ class WindowsOverlappedReader:
             raise self._ctypes.WinError(self._ctypes.get_last_error())
         return bytes(buffer.raw[: transferred.value])
 
+    def _duplicate_current_thread_handle(self) -> object:
+        duplicated = self._wintypes.HANDLE()
+        if not self._kernel32.DuplicateHandle(
+            self._kernel32.GetCurrentProcess(),
+            self._kernel32.GetCurrentThread(),
+            self._kernel32.GetCurrentProcess(),
+            self._ctypes.byref(duplicated),
+            0,
+            False,
+            0x00000002,  # DUPLICATE_SAME_ACCESS
+        ):
+            raise self._ctypes.WinError(self._ctypes.get_last_error())
+        return duplicated.value
+
+    def _request_cancel(self, overlapped: object, thread_handle: object | None) -> None:
+        # Best-effort at both layers.  USB drivers may not have queued an IRP
+        # yet, so CancelIoEx / CancelSynchronousIo failing is not fatal; the
+        # wait loop decides whether cancellation completed.
+        self._kernel32.CancelIoEx(self._handle, self._ctypes.byref(overlapped))
+        if thread_handle:
+            self._kernel32.CancelSynchronousIo(thread_handle)
+
     def _cancel(
         self,
-        pending: tuple[object, object, object],
+        pending: tuple[object, object, object, object],
         reason: Literal["budget", "stop"],
     ) -> None:
-        buffer, overlapped, event = pending
-        cancelled = self._kernel32.CancelIoEx(
-            self._handle, self._ctypes.byref(overlapped)
-        )
-        if not cancelled:
-            error = self._ctypes.get_last_error()
-            if error != 1168:  # ERROR_NOT_FOUND: request completed during cancellation.
-                raise self._ctypes.WinError(error)
+        buffer, overlapped, event, thread_handle = pending
+        self._request_cancel(overlapped, thread_handle)
 
         deadline = time.monotonic() + self._cancel_grace
         while time.monotonic() < deadline:
+            self._request_cancel(overlapped, thread_handle)
             if self._wait(event, min(self._poll_interval, deadline - time.monotonic())) == 0:
                 try:
                     self._result(overlapped, buffer)
@@ -221,6 +259,7 @@ class WindowsOverlappedReader:
                     if getattr(exc, "winerror", None) != 995:  # ERROR_OPERATION_ABORTED
                         raise
                 self._close_handle(event)
+                self._close_handle(thread_handle)
                 raise ReadCancelledError(reason, cancellation_completed=True)
 
         self._pending = pending
@@ -252,42 +291,82 @@ class WindowsOverlappedReader:
         overlapped.Offset = offset & 0xFFFFFFFF
         overlapped.OffsetHigh = (offset >> 32) & 0xFFFFFFFF
         overlapped.hEvent = event
-        pending = (buffer, overlapped, event)
         immediate = self._wintypes.DWORD()
+        started_event = threading.Event()
+        issue_error: list[BaseException] = []
+        thread_handles: list[object] = []
+
+        def issue() -> None:
+            try:
+                thread_handles.append(self._duplicate_current_thread_handle())
+            except OSError as exc:
+                issue_error.append(exc)
+                started_event.set()
+                self._kernel32.SetEvent(event)
+                return
+            started_event.set()
+            issued = self._kernel32.ReadFile(
+                self._handle,
+                buffer,
+                size,
+                self._ctypes.byref(immediate),
+                self._ctypes.byref(overlapped),
+            )
+            if issued:
+                self._kernel32.SetEvent(event)
+                return
+            error = self._ctypes.get_last_error()
+            if error != 997:  # ERROR_IO_PENDING
+                issue_error.append(self._ctypes.WinError(error))
+                self._kernel32.SetEvent(event)
+
+        worker = threading.Thread(
+            target=issue, name="flvrescue-windows-read", daemon=True
+        )
+        worker.start()
+        if not started_event.wait(self._cancel_grace):
+            self._close_handle(event)
+            raise OSError("Windows read thread did not start")
+        thread_handle = thread_handles[0] if thread_handles else None
+        pending = (buffer, overlapped, event, thread_handle)
         started = time.monotonic()
 
-        issued = self._kernel32.ReadFile(
-            self._handle,
-            buffer,
-            size,
-            self._ctypes.byref(immediate),
-            self._ctypes.byref(overlapped),
-        )
-        if issued:
-            self._close_handle(event)
-            return bytes(buffer.raw[: immediate.value])
-        error = self._ctypes.get_last_error()
-        if error != 997:  # ERROR_IO_PENDING
-            self._close_handle(event)
-            raise self._ctypes.WinError(error)
-
-        while True:
-            elapsed = time.monotonic() - started
-            reason: Literal["budget", "stop"] | None = None
-            if stop_event is not None and stop_event.is_set():
-                reason = "stop"
-            elif elapsed >= budget:
-                reason = "budget"
-            if reason is not None:
-                if on_cancel is not None:
-                    on_cancel("cancel requested")
-                self._cancel(pending, reason)
-            wait_for = min(self._poll_interval, max(0.0, budget - elapsed))
-            if self._wait(event, wait_for) == 0:
-                try:
-                    return self._result(overlapped, buffer)
-                finally:
-                    self._close_handle(event)
+        try:
+            while True:
+                elapsed = time.monotonic() - started
+                reason: Literal["budget", "stop"] | None = None
+                if stop_event is not None and stop_event.is_set():
+                    reason = "stop"
+                elif elapsed >= budget:
+                    reason = "budget"
+                if self._wait(event, 0) == 0:
+                    if issue_error:
+                        self._close_handle(event)
+                        self._close_handle(thread_handle)
+                        raise issue_error[0]
+                    try:
+                        return self._result(overlapped, buffer)
+                    finally:
+                        self._close_handle(event)
+                        self._close_handle(thread_handle)
+                if reason is not None:
+                    if on_cancel is not None:
+                        on_cancel("cancel requested")
+                    self._cancel(pending, reason)
+                wait_for = min(self._poll_interval, max(0.0, budget - elapsed))
+                if self._wait(event, wait_for) == 0:
+                    if issue_error:
+                        self._close_handle(event)
+                        self._close_handle(thread_handle)
+                        raise issue_error[0]
+                    try:
+                        return self._result(overlapped, buffer)
+                    finally:
+                        self._close_handle(event)
+                        self._close_handle(thread_handle)
+        finally:
+            if worker.is_alive():
+                worker.join(timeout=0.0)
 
     def read_at(self, offset: int, size: int) -> bytes:
         return self.read_at_cancellable(offset, size, budget=24 * 60 * 60)
