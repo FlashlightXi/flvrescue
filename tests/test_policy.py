@@ -80,3 +80,37 @@ def test_map_rejects_an_unknown_persisted_policy_field() -> None:
                 "policy": {**DEFAULT_POLICY.to_dict(), "future_field": True},
             }
         )
+
+
+def test_map_v3_with_policy_v2_adopts_read_budgets() -> None:
+    policy = DEFAULT_POLICY.to_dict()
+    policy["version"] = 2
+    for name in (
+        "slow_block",
+        "hard_block",
+        "survey_budget",
+        "fast_budget",
+        "slow_budget",
+        "hard_budget",
+        "deep_budget",
+    ):
+        policy.pop(name)
+
+    state = map_from_dict(
+        {
+            "version": 3,
+            "source_path": "source.flv",
+            "source_size": 1,
+            "destination_path": "rescued.flv",
+            "current_pass": 2,
+            "pass_cursor": 0,
+            "adaptive_skip": 0,
+            "ranges": [{"offset": 0, "length": 1, "status": "skipped", "cause": "survey"}],
+            "policy": policy,
+        }
+    )
+
+    assert state.policy is not None
+    assert state.policy.version == 3
+    assert state.policy.fast_budget == DEFAULT_POLICY.fast_budget
+    assert state.policy.slow_block == DEFAULT_POLICY.slow_block

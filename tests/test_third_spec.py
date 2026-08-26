@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import ctypes
 import io
 import os
 import signal
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -135,6 +137,70 @@ def test_pending_cancellation_stops_after_checkpoint(tmp_path: Path) -> None:
     saved = load_map(map_path)
     assert saved.ranges[0].status == "skipped"
     assert saved.ranges[0].cause == "pass_1_budget"
+
+
+def test_pending_fast_pass_cancel_defers_the_rest_of_the_hole(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.flv"
+    destination = tmp_path / "rescued.flv"
+    map_path = tmp_path / "rescued.map.json"
+    payload = bytes(range(48))
+    source.write_bytes(payload)
+    destination.write_bytes(payload[:16] + b"\0" * 32)
+    save_map_atomic(
+        map_path,
+        RescueMap(
+            source_path=str(source.resolve()),
+            source_size=len(payload),
+            destination_path=str(destination.resolve()),
+            ranges=[
+                RecoveryRange(0, 16, "recovered", None, "fast"),
+                RecoveryRange(16, 32, "skipped", "survey"),
+            ],
+            current_pass=2,
+            pass_cursor=16,
+            policy=small_policy(),
+        ),
+    )
+
+    result = rescue(
+        source,
+        destination,
+        map_path=map_path,
+        reader_factory=lambda _source: CancellingReader(payload, completed=False),
+        progress=False,
+        policy=small_policy(),
+        through="fast",
+    )
+
+    assert result.stopped is True
+    assert result.cancellation_pending is True
+    saved = load_map(map_path)
+    assert [
+        (item.offset, item.length, item.status, item.cause, item.difficulty)
+        for item in saved.ranges
+    ] == [
+        (0, 16, "recovered", None, "fast"),
+        (16, 16, "skipped", "pass_2_budget", "slow"),
+        (32, 16, "skipped", "fast_pass", "slow"),
+    ]
+    assert saved.easy_skipped_bytes == 0
+
+    reader = FaultInjectingReader(payload)
+    resumed = rescue(
+        source,
+        destination,
+        map_path=map_path,
+        reader_factory=lambda _source: reader,
+        progress=False,
+        policy=small_policy(),
+        through="fast",
+    )
+
+    assert reader.calls == []
+    assert resumed.easy_skipped_bytes == 0
+    assert resumed.current_pass == 3
 
 
 def test_deep_budget_cancellation_does_not_mark_pass_complete(tmp_path: Path) -> None:
@@ -316,6 +382,34 @@ def test_windows_overlapped_reader_reads_at_an_explicit_offset(tmp_path: Path) -
         assert reader.read_at_cancellable(3, 4, budget=1.0) == b"3456"
     finally:
         reader.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows-only overlapped I/O")
+def test_windows_budget_runs_while_readfile_call_is_blocked(tmp_path: Path) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"0123456789")
+    reader = WindowsOverlappedReader(
+        source, cancel_grace=0.5, poll_interval=0.01
+    )
+    release = threading.Event()
+
+    def blocked_read_file(*_args: object) -> bool:
+        release.wait(timeout=1.0)
+        ctypes.set_last_error(995)  # ERROR_OPERATION_ABORTED
+        return False
+
+    reader._kernel32.ReadFile = blocked_read_file
+    reader._request_cancel = lambda _overlapped, _thread: release.set()  # type: ignore[method-assign]
+    started = time.monotonic()
+    try:
+        with pytest.raises(ReadCancelledError) as raised:
+            reader.read_at_cancellable(0, 4, budget=0.05)
+    finally:
+        reader.close()
+
+    assert raised.value.reason == "budget"
+    assert raised.value.cancellation_completed is True
+    assert time.monotonic() - started < 1.0
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows-only overlapped I/O")

@@ -547,7 +547,15 @@ def rescue(
                 reporter.end_read(status="error")
             raise
 
-    def defer_cancelled(offset: int, length: int, outcome: ReadOutcome) -> None:
+    def defer_cancelled(offset: int, length: int, outcome: ReadOutcome) -> bool:
+        """Mark a budget-expired read. Return True if recovery must stop now.
+
+        Callers finish pass-local bookkeeping (cursor, remainder of the current
+        hole, adaptive skip) before raising.  That way a still-pending Windows
+        cancel does not leave the rest of a Fast/Slow hole classified as a
+        likely-fast survey gap for the next resume.
+        """
+
         if outcome.cancel_reason == "stop":
             event("normal", f"Stopped read at offset {offset}; range remains pending")
             raise _GracefulStop(
@@ -562,11 +570,12 @@ def rescue(
         )
         # Deep has no later pass to inherit a budget-expired range. Stop at the
         # checkpoint instead of advancing to the terminal pass with unresolved
-        # bytes still present.
-        if (
-            state.current_pass >= 5
-            or not outcome.cancellation_completed
-        ):
+        # bytes still present.  A still-pending cancel also stops new source
+        # reads; the current hole may still be reclassified first.
+        return state.current_pass >= 5 or not outcome.cancellation_completed
+
+    def stop_after_cancel(outcome: ReadOutcome, stop_now: bool) -> None:
+        if stop_now:
             raise _GracefulStop(
                 cancellation_pending=not outcome.cancellation_completed
             )
@@ -664,12 +673,13 @@ def rescue(
             length = min(policy.block, item.end - offset)
             outcome = read_once(offset, length, status="reading")
             if outcome.cancelled:
-                defer_cancelled(offset, length, outcome)
+                stop_now = defer_cancelled(offset, length, outcome)
                 state.pass_cursor += length
                 note_slow_or_error()
                 apply_adaptive_skip("slow")
                 maybe_checkpoint(force=True)
                 report("skip")
+                stop_after_cancel(outcome, stop_now)
                 continue
             if outcome.data is not None:
                 difficulty = difficulty_for(outcome.elapsed)
@@ -720,7 +730,7 @@ def rescue(
                 length = min(policy.block, hole.end - cursor)
                 outcome = read_once(cursor, length, status="reading")
                 if outcome.cancelled:
-                    defer_cancelled(cursor, length, outcome)
+                    stop_now = defer_cancelled(cursor, length, outcome)
                     cursor += length
                     state.pass_cursor = cursor
                     if cursor < hole.end:
@@ -733,6 +743,7 @@ def rescue(
                         )
                     maybe_checkpoint(force=True)
                     report("skip")
+                    stop_after_cancel(outcome, stop_now)
                     break
                 if outcome.data is not None:
                     difficulty = difficulty_for(outcome.elapsed)
@@ -811,7 +822,7 @@ def rescue(
                 length = min(policy.block_for_pass(3), target.end - cursor)
                 outcome = read_once(cursor, length, status="reading")
                 if outcome.cancelled:
-                    defer_cancelled(cursor, length, outcome)
+                    stop_now = defer_cancelled(cursor, length, outcome)
                     cursor += length
                     state.pass_cursor = cursor
                     if cursor < target.end:
@@ -824,6 +835,7 @@ def rescue(
                         )
                     maybe_checkpoint(force=True)
                     report("skip")
+                    stop_after_cancel(outcome, stop_now)
                     break
                 if outcome.data is not None:
                     difficulty = difficulty_for(outcome.elapsed)
@@ -891,8 +903,9 @@ def rescue(
             while cursor < target.end:
                 length = min(policy.block_for_pass(4), target.end - cursor)
                 outcome = read_once(cursor, length, status="reading")
+                stop_now = False
                 if outcome.cancelled:
-                    defer_cancelled(cursor, length, outcome)
+                    stop_now = defer_cancelled(cursor, length, outcome)
                     event(
                         "hard",
                         f"Hard-pass read deferred at offset {cursor}: {outcome.failure}",
@@ -915,6 +928,7 @@ def rescue(
                 state.pass_cursor = cursor
                 maybe_checkpoint(force=outcome.data is None)
                 report("error" if outcome.data is None else "normal")
+                stop_after_cancel(outcome, stop_now)
             state.pass_cursor = target.end
         state.current_pass, state.pass_cursor, state.adaptive_skip = 5, 0, 0
         checkpoint()
@@ -928,7 +942,8 @@ def rescue(
             size = min(policy.sector, end - cursor)
             outcome = read_once(cursor, size, status="reading")
             if outcome.cancelled:
-                defer_cancelled(cursor, size, outcome)
+                stop_now = defer_cancelled(cursor, size, outcome)
+                stop_after_cancel(outcome, stop_now)
             elif outcome.data is None:
                 zero_unreadable(cursor, size)
             else:
@@ -940,7 +955,8 @@ def rescue(
     def recover_fallback_piece(offset: int, length: int) -> None:
         outcome = read_once(offset, length, status="reading")
         if outcome.cancelled:
-            defer_cancelled(offset, length, outcome)
+            stop_now = defer_cancelled(offset, length, outcome)
+            stop_after_cancel(outcome, stop_now)
         elif outcome.data is not None:
             write_recovered(
                 offset, outcome.data, difficulty=difficulty_for(outcome.elapsed)
@@ -953,7 +969,8 @@ def rescue(
     def recover_deep_block(offset: int, length: int) -> bool:
         outcome = read_once(offset, length, status="reading")
         if outcome.cancelled:
-            defer_cancelled(offset, length, outcome)
+            stop_now = defer_cancelled(offset, length, outcome)
+            stop_after_cancel(outcome, stop_now)
             return True
         if outcome.data is not None:
             write_recovered(

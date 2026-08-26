@@ -179,7 +179,7 @@ flvrescue mark rescued.flv.rescue.json --offset 48G --length 512M --clear
 
 On the CLI, the first Ctrl+C requests cancellation of the active Windows read, checkpoints the map, and stops before starting another source read. Press Ctrl+C a second time only when immediate process exit is necessary. That second exit cannot promise that the drive or its controller has physically stopped I/O; wait for drive activity to settle before disconnecting hardware.
 
-With `--reader auto`, Windows uses explicit-offset overlapped reads and `CancelIoEx`. Other platforms use the serial portable reader. The portable reader still checkpoints between reads, but a blocking operating-system read already in progress cannot be interrupted by the time budget.
+With `--reader auto`, Windows uses explicit-offset overlapped reads issued off the wait/cancel thread, then `CancelIoEx` and `CancelSynchronousIo`. Other platforms use the serial portable reader. The portable reader still checkpoints between reads, but a blocking operating-system read already in progress cannot be interrupted by the time budget.
 
 ## Library API
 
