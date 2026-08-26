@@ -19,16 +19,17 @@ Coverage includes:
 - Fast Pass continuation over normal ranges without fallback reads
 - Slow detection, adaptive skip growth, skip-reset hysteresis, and normal-region rediscovery
 - Pass 1 optional survey stride for whole-file sampling
-- Pass 2 Fast of likely-fast survey skips and Pass 3 Slow without hard-region pursuit
+- Pass 2 Fast of likely-fast survey skips, Fast budget-cancel routing to Hard, and Pass 3 Slow without hard-region pursuit
 - Bounded Pass 4 Hard attempts and optional Pass 5 Deep block/fallback/sector localization
 - Per-pass read-budget deferral, completed and still-pending cancellation, remainder-of-hole deferral on a pending Fast-pass cancel, and no new read after a stop request
 - Windows overlapped explicit-offset reads issued off the wait/cancel thread, a simulated driver-blocked `ReadFile` budget, and an end-to-end Windows backend rescue
+- Windows CRC and other storage OS errors preserved in event text
 - Saved policy validation, legacy-policy adoption, and strict `resume` destination/map matching
 - `flvrescue status` occupancy rendering and pass labels from a saved map
 - Range splitting, merging, and zero-filling of final unreadable units
 - Ctrl+C checkpointing and resume without rereading recovered ranges
 - Safe migration of v1 prefix and v2 range maps to map v3, including policy v1/v2 to v3
-- Progress updates while a simulated source read is blocked, and destination preparation without a fake percent
+- Progress updates while a simulated source read is blocked, live-bar wrap counting, and destination preparation without a fake percent
 - Local read-marker alignment, color-independent glyphs, and timed Slow/Hard display states
 - Manual Slow/Hard/Deep routing that changes only unresolved map ranges
 - Malformed or mismatched maps and unsafe path aliases

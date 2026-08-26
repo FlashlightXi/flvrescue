@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1 - unreleased
+
+- Route Fast-pass budget cancels to Hard. The rest of that survey hole stays Slow.
+- Keep the local offset bar after a short Fast read ends, and redraw as soon as a read starts.
+- Count wrapped terminal rows so live redraw does not erase CRC/OS error lines.
+- Keep Windows storage errors such as CRC in the durable event text.
+- Swallow I/O-thread exceptions at shutdown so a still-pending cancel does not print `Fatal Python error` on stderr.
+
 ## 0.3.0 - 2026-08-26
 
 - Issue Windows `ReadFile` on a dedicated thread so Fast-pass time budgets and Ctrl+C still run when a USB driver blocks inside the call.

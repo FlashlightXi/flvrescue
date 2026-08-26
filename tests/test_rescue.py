@@ -547,6 +547,18 @@ def test_progress_updates_while_reader_is_blocked(tmp_path: Path) -> None:
     assert any("source.flv" in line for line in lines)
 
 
+def test_progress_keeps_the_local_bar_after_a_fast_read_ends() -> None:
+    stream = io.StringIO()
+    reporter = ProgressReporter(1024, label="clip.flv", stream=stream, update_interval=10)
+    reporter.begin_read(128, 64, section_start=0, section_end=256)
+    reporter.end_read(status="normal")
+    assert reporter._snapshot.read_offset == 128
+    assert reporter._snapshot.read_size == 64
+    assert reporter._snapshot.read_started_at is None
+    assert reporter._snapshot.read_frozen_elapsed is not None
+    reporter.close()
+
+
 def test_rejects_malformed_map_and_source_destination_aliases(tmp_path: Path) -> None:
     source = tmp_path / "source.flv"
     destination = tmp_path / "rescued.flv"

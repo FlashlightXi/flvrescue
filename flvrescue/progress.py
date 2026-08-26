@@ -15,6 +15,7 @@ from .display import (
     format_live_lines,
     format_preparing_lines,
     tally_kinds,
+    visual_line_count,
 )
 
 
@@ -67,6 +68,7 @@ class ProgressSnapshot:
     read_offset: int | None = None
     read_size: int = 0
     read_started_at: float | None = None
+    read_frozen_elapsed: float | None = None
     section_start: int | None = None
     section_end: int | None = None
     slow_threshold: float = 2.0
@@ -184,11 +186,13 @@ class ProgressReporter:
                 read_offset=offset,
                 read_size=size,
                 read_started_at=self._clock(),
+                read_frozen_elapsed=None,
                 section_start=section_start,
                 section_end=section_end,
                 slow_threshold=slow_threshold,
                 hard_threshold=hard_threshold,
             )
+        self._wake.set()
 
     def set_read_status(self, status: str) -> None:
         with self._lock:
@@ -196,16 +200,21 @@ class ProgressReporter:
         self._wake.set()
 
     def end_read(self, *, status: str) -> None:
+        now = self._clock()
         with self._lock:
+            started = self._snapshot.read_started_at
+            frozen = (
+                max(0.0, now - started)
+                if started is not None
+                else self._snapshot.read_frozen_elapsed
+            )
             self._snapshot = replace(
                 self._snapshot,
                 status=status,
-                read_offset=None,
-                read_size=0,
                 read_started_at=None,
-                section_start=None,
-                section_end=None,
+                read_frozen_elapsed=frozen,
             )
+        self._wake.set()
 
     def announce_pass(self, pass_number: int) -> None:
         self.event(
@@ -250,11 +259,10 @@ class ProgressReporter:
             )
         counts = tally_kinds(snapshot.ranges, snapshot.total)
         width = max(40, shutil.get_terminal_size(fallback=(100, 24)).columns)
-        read_elapsed = (
-            max(0.0, now - snapshot.read_started_at)
-            if snapshot.read_started_at is not None
-            else 0.0
-        )
+        if snapshot.read_started_at is not None:
+            read_elapsed = max(0.0, now - snapshot.read_started_at)
+        else:
+            read_elapsed = snapshot.read_frozen_elapsed or 0.0
         read_status = snapshot.status
         if snapshot.read_started_at is not None and snapshot.status not in {
             "cancel requested",
@@ -285,7 +293,17 @@ class ProgressReporter:
             section_end=snapshot.section_end,
         )
 
+    def _emit(self, text: str) -> None:
+        if self._closed:
+            return
+        try:
+            self.stream.write(text)
+        except (OSError, ValueError, RuntimeError):
+            self._closed = True
+
     def _render(self, *, final: bool = False) -> None:
+        if self._closed and not final:
+            return
         now = self._clock()
         snapshot, events = self._snapshot_and_events()
         speed_interval = max(now - self._last_speed_at, 1e-9)
@@ -293,23 +311,28 @@ class ProgressReporter:
             self._speed = max(0, snapshot.recovered - self._last_recovered) / speed_interval
             self._last_recovered = snapshot.recovered
             self._last_speed_at = now
+        width = max(40, shutil.get_terminal_size(fallback=(100, 24)).columns)
         if self._tty:
             if self._live_lines:
-                self.stream.write(f"\x1b[{self._live_lines}A")
+                self._emit(f"\x1b[{self._live_lines}A")
                 for _ in range(self._live_lines):
-                    self.stream.write("\r\x1b[2K\n")
-                self.stream.write(f"\x1b[{self._live_lines}A")
+                    self._emit("\r\x1b[2K\n")
+                self._emit(f"\x1b[{self._live_lines}A")
             for kind, message in events:
-                self.stream.write(self._color(self._truncate(message), kind) + "\n")
+                self._emit(self._color(self._truncate(message), kind) + "\n")
             lines = self._lines(snapshot, now)
             for line in lines:
-                self.stream.write("\r\x1b[2K" + line + "\n")
-            self._live_lines = len(lines)
+                self._emit("\r\x1b[2K" + line + "\n")
+            self._live_lines = visual_line_count(lines, width)
         else:
             for kind, message in events:
-                self.stream.write(f"[{kind}] {message}\n")
-            self.stream.write("\n".join(self._lines(snapshot, now)) + "\n")
-        self.stream.flush()
+                self._emit(f"[{kind}] {message}\n")
+            self._emit("\n".join(self._lines(snapshot, now)) + "\n")
+        try:
+            if not self._closed:
+                self.stream.flush()
+        except (OSError, ValueError, RuntimeError):
+            self._closed = True
 
     def _render_loop(self) -> None:
         try:
@@ -319,17 +342,17 @@ class ProgressReporter:
                 if self._stop.is_set():
                     break
                 self._render()
-        except (OSError, ValueError):
+        except (OSError, ValueError, RuntimeError):
             return
 
     def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
         self._stop.set()
         self._wake.set()
         self._thread.join(timeout=max(2.0, self.update_interval * 2))
         try:
             self._render(final=True)
-        except (OSError, ValueError):
+        except (OSError, ValueError, RuntimeError):
             pass
+        self._closed = True

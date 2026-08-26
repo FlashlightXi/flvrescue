@@ -18,6 +18,17 @@ from typing import Literal, Protocol, runtime_checkable
 ReaderBackend = Literal["auto", "windows", "portable"]
 
 
+def _quiet_flvrescue_thread_exception(args: threading.ExceptHookArgs) -> None:
+    thread = args.thread
+    if thread is not None and thread.name.startswith("flvrescue-"):
+        return
+    _PREVIOUS_THREAD_EXCEPTHOOK(args)
+
+
+_PREVIOUS_THREAD_EXCEPTHOOK = threading.excepthook
+threading.excepthook = _quiet_flvrescue_thread_exception
+
+
 class ReadCancelledError(OSError):
     """A bounded read was cancelled or could not finish cancellation promptly."""
 
@@ -31,6 +42,31 @@ class ReadCancelledError(OSError):
         self.cancellation_completed = cancellation_completed
         detail = "completed" if cancellation_completed else "still pending"
         super().__init__(f"read cancelled after {reason}; cancellation {detail}")
+
+
+WINDOWS_STORAGE_ERRORS: dict[int, str] = {
+    21: "NOT_READY",
+    23: "CRC",
+    31: "GEN_FAILURE",
+    1117: "IO_DEVICE",
+    1167: "DEVICE_NOT_CONNECTED",
+}
+
+
+def describe_os_error(exc: BaseException) -> str:
+    """Return a short, durable label for a source-read OSError."""
+
+    code = getattr(exc, "winerror", None)
+    if not isinstance(code, int):
+        code = getattr(exc, "errno", None)
+    detail = str(exc).strip().replace("\r", " ").splitlines()
+    text = detail[0][:160] if detail else ""
+    if isinstance(code, int) and code:
+        name = WINDOWS_STORAGE_ERRORS.get(code)
+        if name:
+            return f"{code} {name}: {text}" if text else f"{code} {name}"
+        return f"{code}: {text}" if text else str(code)
+    return text or "read error"
 
 
 @runtime_checkable
@@ -333,6 +369,8 @@ class WindowsOverlappedReader:
                     issue_result.append("pending")
                 else:
                     issue_error.append(self._ctypes.WinError(error))
+            except BaseException as exc:
+                issue_error.append(exc)
             finally:
                 # Do not signal the native OVERLAPPED event here. The main
                 # thread may already have closed it after cancellation; a late

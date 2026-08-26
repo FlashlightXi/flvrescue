@@ -16,7 +16,14 @@ from flvrescue.display import (
     render_stacked_bar,
     strip_ansi,
     tally_kinds,
+    visual_line_count,
 )
+
+
+def test_visual_line_count_includes_wrapped_rows() -> None:
+    assert visual_line_count(["abc", "de"], width=10) == 2
+    assert visual_line_count(["abcdefghijabcdefghij"], width=10) == 2
+    assert visual_line_count([f"\x1b[32m{'x' * 20}\x1b[0m"], width=10) == 2
 
 
 def test_range_kind_splits_survey_skips_from_slow_skips() -> None:
