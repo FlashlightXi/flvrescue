@@ -15,7 +15,7 @@ from flvrescue.cli import main
 from flvrescue.interrupts import StopController, two_stage_interrupts
 from flvrescue.mapfile import RecoveryRange, RescueMap, load_map, save_map_atomic
 from flvrescue.policy import RecoveryPolicy
-from flvrescue.reader import ReadCancelledError, WindowsOverlappedReader
+from flvrescue.reader import ReadCancelledError, WindowsOverlappedReader, describe_os_error
 from flvrescue.rescue import rescue
 
 
@@ -182,7 +182,7 @@ def test_pending_fast_pass_cancel_defers_the_rest_of_the_hole(
         for item in saved.ranges
     ] == [
         (0, 16, "recovered", None, "fast"),
-        (16, 16, "skipped", "pass_2_budget", "slow"),
+        (16, 16, "skipped", "pass_2_budget", "hard"),
         (32, 16, "skipped", "fast_pass", "slow"),
     ]
     assert saved.easy_skipped_bytes == 0
@@ -201,6 +201,103 @@ def test_pending_fast_pass_cancel_defers_the_rest_of_the_hole(
     assert reader.calls == []
     assert resumed.easy_skipped_bytes == 0
     assert resumed.current_pass == 3
+
+
+class _CrcReader(FaultInjectingReader):
+    def read_at(self, offset: int, size: int) -> bytes:
+        self.calls.append((offset, size))
+        error = OSError("巡回冗長検査 (CRC) エラーです")
+        error.winerror = 23
+        raise error
+
+
+def test_fast_pass_budget_cancel_is_hard_and_the_rest_of_the_hole_stays_slow(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.flv"
+    destination = tmp_path / "rescued.flv"
+    map_path = tmp_path / "rescued.map.json"
+    payload = bytes(range(48))
+    source.write_bytes(payload)
+    destination.write_bytes(payload[:16] + b"\0" * 32)
+    save_map_atomic(
+        map_path,
+        RescueMap(
+            source_path=str(source.resolve()),
+            source_size=len(payload),
+            destination_path=str(destination.resolve()),
+            ranges=[
+                RecoveryRange(0, 16, "recovered", None, "fast"),
+                RecoveryRange(16, 32, "skipped", "survey"),
+            ],
+            current_pass=2,
+            pass_cursor=16,
+            policy=small_policy(),
+        ),
+    )
+
+    result = rescue(
+        source,
+        destination,
+        map_path=map_path,
+        reader_factory=lambda _source: CancellingReader(payload, completed=True),
+        progress=False,
+        policy=small_policy(),
+        through="fast",
+    )
+
+    assert result.stopped is False
+    saved = load_map(map_path)
+    assert saved.ranges[1].cause == "pass_2_budget"
+    assert saved.ranges[1].difficulty == "hard"
+    assert saved.ranges[2].cause == "fast_pass"
+    assert saved.ranges[2].difficulty == "slow"
+    assert saved.current_pass == 3
+    assert result.hard_skipped_bytes == 16
+
+
+def test_windows_crc_error_is_kept_in_the_failure_text(tmp_path: Path) -> None:
+    source = tmp_path / "source.flv"
+    destination = tmp_path / "rescued.flv"
+    map_path = tmp_path / "rescued.map.json"
+    payload = bytes(range(16))
+    source.write_bytes(payload)
+    events: list[tuple[str, str]] = []
+
+    class _Sink:
+        def update(self, **_values: object) -> None:
+            return None
+
+        def begin_read(self, offset: int, size: int, *, status: str = "reading") -> None:
+            return None
+
+        def end_read(self, *, status: str) -> None:
+            return None
+
+        def event(self, kind: str, message: str) -> None:
+            events.append((kind, message))
+
+        def close(self) -> None:
+            return None
+
+    result = rescue(
+        source,
+        destination,
+        map_path=map_path,
+        reader_factory=lambda _source: _CrcReader(payload),
+        progress=_Sink(),
+        policy=small_policy(),
+        through="survey",
+    )
+
+    assert result.unreadable_bytes == 16
+    assert any("23 CRC" in message for _kind, message in events)
+
+
+def test_describe_os_error_names_crc() -> None:
+    error = OSError("巡回冗長検査 (CRC) エラーです")
+    error.winerror = 23
+    assert describe_os_error(error).startswith("23 CRC")
 
 
 def test_deep_budget_cancellation_does_not_mark_pass_complete(tmp_path: Path) -> None:

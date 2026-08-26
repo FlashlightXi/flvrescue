@@ -20,7 +20,7 @@ from .mapfile import (
 from .policy import DEFAULT_POLICY, PASS_ALIASES, PASS_NAME_TO_NUMBER, RecoveryPolicy
 from .progress import ProgressReporter
 from .interrupts import StopController
-from .reader import ReadCancelledError, Reader, ReaderBackend, open_reader
+from .reader import ReadCancelledError, Reader, ReaderBackend, describe_os_error, open_reader
 from .storage import prepare_destination, zero_destination_range
 
 
@@ -524,11 +524,12 @@ def rescue(
                     cancel_reason=exc.reason,
                     cancellation_completed=exc.cancellation_completed,
                 )
-            except OSError:
+            except OSError as exc:
                 elapsed = max(0.0, clock() - started)
+                failure = describe_os_error(exc)
                 if reporter is not None:
                     reporter.end_read(status="error")
-                return ReadOutcome(None, elapsed, "read error")
+                return ReadOutcome(None, elapsed, failure)
             if not isinstance(raw, (bytes, bytearray, memoryview)):
                 raise TypeError("Reader.read_at() must return bytes-like data")
             elapsed = max(0.0, clock() - started)
@@ -561,7 +562,7 @@ def rescue(
             raise _GracefulStop(
                 cancellation_pending=not outcome.cancellation_completed
             )
-        difficulty: RangeDifficulty = "slow" if state.current_pass <= 2 else "hard"
+        difficulty: RangeDifficulty = "slow" if state.current_pass <= 1 else "hard"
         cause = f"pass_{state.current_pass}_budget"
         state.replace_range(offset, length, "skipped", cause, difficulty)
         event(

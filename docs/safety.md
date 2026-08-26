@@ -23,7 +23,7 @@ It is complementary to, not a replacement for, device-level recovery tools such 
 
 On Windows, the default backend uses one explicit-offset overlapped `ReadFile` request at a time. The call itself runs on a dedicated I/O thread so a storage driver that blocks inside `ReadFile` cannot freeze the budget wait or the first Ctrl+C handler. Each pass has a saved per-read time budget. When the budget expires or Ctrl+C requests a stop, `flvrescue` calls `CancelIoEx` and `CancelSynchronousIo` and waits briefly for Windows to acknowledge completion.
 
-Windows request cancellation is not a physical-device guarantee. A storage driver, USB bridge, or drive firmware may continue lower-level work after Windows reports cancellation. If cancellation is still pending after the grace period, `flvrescue` checkpoints and starts no further reads; it keeps the native request storage alive until process exit rather than releasing memory still owned by the kernel.
+Windows request cancellation is not a physical-device guarantee. A storage driver, USB bridge, or drive firmware may continue lower-level work after Windows reports cancellation. If cancellation is still pending after the grace period, `flvrescue` checkpoints and starts no further reads; it keeps the native request storage alive until process exit rather than releasing memory still owned by the kernel. A Fast-pass budget cancel is classified as Hard. Source `OSError` values such as Windows CRC are recorded in the event log instead of being left only on a flashing console line.
 
 Pass 4 performs no fallback or sector localization and makes one attempt per coarse block. Pass 5 is the only exhaustive fallback stage and is never selected by default or by `optimize`.
 

@@ -149,7 +149,7 @@ Storage mode: sparse
 
 Labels on the third line are gray; the numbers use the same colors as the bar.
 
-The read state changes from `READING` to `SLOW` and then `HARD` while a read is still pending. A budget expiry requests cancellation and leaves the range eligible for a later pass; it is not falsely recorded as unreadable.
+The read state changes from `READING` to `SLOW` and then `HARD` while a read is still pending. A Fast-pass budget expiry requests cancellation and routes that block to Hard. It is not recorded as unreadable. The rest of the current survey hole stays Slow for Pass 3. Windows CRC and similar storage errors are logged as durable events (`23 CRC`, …) above the live bar.
 
 Pass 1 Survey samples. Pass 2 Fast reads likely-fast candidates. Pass 3 Slow handles light-slow ranges. Pass 4 Hard makes bounded coarse attempts. Pass 5 Deep is the explicit fine-grained exhaustive stage.
 

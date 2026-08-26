@@ -53,6 +53,17 @@ def strip_ansi(text: str) -> str:
     return ANSI_RE.sub("", text)
 
 
+def visual_line_count(lines: Sequence[str], width: int) -> int:
+    """Count terminal rows after wrapping, so live redraw does not erase log lines."""
+
+    columns = max(1, width)
+    rows = 0
+    for line in lines:
+        visible = len(strip_ansi(line))
+        rows += 1 if visible <= 0 else (visible + columns - 1) // columns
+    return rows
+
+
 def paint(text: str, color: str, *, enabled: bool) -> str:
     if not enabled or not color:
         return text
