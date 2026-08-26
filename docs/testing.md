@@ -22,7 +22,7 @@ Coverage includes:
 - Pass 2 Fast of likely-fast survey skips and Pass 3 Slow without hard-region pursuit
 - Bounded Pass 4 Hard attempts and optional Pass 5 Deep block/fallback/sector localization
 - Per-pass read-budget deferral, completed and still-pending cancellation, remainder-of-hole deferral on a pending Fast-pass cancel, and no new read after a stop request
-- Windows overlapped explicit-offset reads issued off the wait/cancel thread, and an end-to-end Windows backend rescue
+- Windows overlapped explicit-offset reads issued off the wait/cancel thread, a simulated driver-blocked `ReadFile` budget, and an end-to-end Windows backend rescue
 - Saved policy validation, legacy-policy adoption, and strict `resume` destination/map matching
 - `flvrescue status` occupancy rendering and pass labels from a saved map
 - Range splitting, merging, and zero-filling of final unreadable units

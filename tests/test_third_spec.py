@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import ctypes
 import io
 import os
 import signal
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -380,6 +382,34 @@ def test_windows_overlapped_reader_reads_at_an_explicit_offset(tmp_path: Path) -
         assert reader.read_at_cancellable(3, 4, budget=1.0) == b"3456"
     finally:
         reader.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows-only overlapped I/O")
+def test_windows_budget_runs_while_readfile_call_is_blocked(tmp_path: Path) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"0123456789")
+    reader = WindowsOverlappedReader(
+        source, cancel_grace=0.5, poll_interval=0.01
+    )
+    release = threading.Event()
+
+    def blocked_read_file(*_args: object) -> bool:
+        release.wait(timeout=1.0)
+        ctypes.set_last_error(995)  # ERROR_OPERATION_ABORTED
+        return False
+
+    reader._kernel32.ReadFile = blocked_read_file
+    reader._request_cancel = lambda _overlapped, _thread: release.set()  # type: ignore[method-assign]
+    started = time.monotonic()
+    try:
+        with pytest.raises(ReadCancelledError) as raised:
+            reader.read_at_cancellable(0, 4, budget=0.05)
+    finally:
+        reader.close()
+
+    assert raised.value.reason == "budget"
+    assert raised.value.cancellation_completed is True
+    assert time.monotonic() - started < 1.0
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows-only overlapped I/O")
