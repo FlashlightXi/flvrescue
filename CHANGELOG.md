@@ -1,13 +1,11 @@
 # Changelog
 
-## 0.3.1 - unreleased
+## 0.3.0 - 2026-08-26
 
 - Issue Windows `ReadFile` on a dedicated thread so Fast-pass time budgets and Ctrl+C still run when a USB driver blocks inside the call.
 - Retry `CancelIoEx` together with `CancelSynchronousIo` while waiting for cancellation.
 - Keep worker completion separate from the native OVERLAPPED event so a late-returning I/O thread cannot signal a closed Windows handle.
 - Classify the rest of the current Fast/Slow hole before stopping on a still-pending cancel, so the next resume does not retry the adjacent survey bytes.
-
-## 0.3.0 - 2026-08-26
 
 - Split recovery into Survey, Fast, Slow, Hard, and opt-in Deep passes.
 - Add persisted slow/hard latency thresholds and per-range difficulty metadata.
