@@ -60,7 +60,7 @@ def recommend_policy(
         raise ValueError("available_space must be a non-negative integer or None")
 
     stride, skip_start, skip_max, checkpoint = _size_tier(source_size)
-    through = "fill"
+    through = "fast"
     if preference == "fast":
         stride *= 2
         skip_start *= 2
@@ -70,7 +70,7 @@ def recommend_policy(
         stride = max(32 * 1024**2, stride // 2)
         skip_start = max(32 * 1024**2, skip_start // 2)
         skip_max = max(512 * 1024**2, skip_max // 2)
-        through = "retry"
+        through = "slow"
 
     policy = DEFAULT_POLICY.with_overrides(
         survey_stride=stride,
@@ -94,7 +94,7 @@ def recommend_policy(
         if through != "survey" and available_space < source_size + reserve:
             through = "survey"
             warnings.append(
-                "Free space may not hold Fill/Retry output; stop after Survey and rotate the batch."
+                "Free space may not hold Fast/Slow output; stop after Survey and rotate the batch."
             )
 
     return OptimizationRecommendation(

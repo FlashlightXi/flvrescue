@@ -17,6 +17,8 @@ def test_default_policy_round_trips_as_a_complete_versioned_contract() -> None:
     assert DEFAULT_POLICY.skip_start == 128 * 1024 * 1024
     assert DEFAULT_POLICY.skip_reset_after == 8
     assert DEFAULT_POLICY.survey_stride == 128 * 1024 * 1024
+    assert DEFAULT_POLICY.slow_threshold == 2.0
+    assert DEFAULT_POLICY.hard_threshold == 10.0
     assert RecoveryPolicy.from_dict(DEFAULT_POLICY.to_dict()) == DEFAULT_POLICY
 
 
@@ -29,12 +31,38 @@ def test_policy_rejects_partial_unknown_and_invalid_values() -> None:
         RecoveryPolicy.from_dict(invalid)
     with pytest.raises(ValueError, match="block >= fallback"):
         DEFAULT_POLICY.with_overrides(block=1024)
+    with pytest.raises(ValueError, match="hard_threshold"):
+        DEFAULT_POLICY.with_overrides(hard_threshold=1.0)
 
 
 def test_policy_override_and_pass_names_are_explicit() -> None:
     assert DEFAULT_POLICY.with_overrides(skip_factor=4).skip_factor == 4
-    assert PASS_NAME_TO_NUMBER == {"survey": 1, "fill": 2, "retry": 3, "deep": 4}
-    assert PASS_NUMBER_TO_NAME == {1: "survey", 2: "fill", 3: "retry", 4: "deep"}
+    assert PASS_NAME_TO_NUMBER == {
+        "survey": 1,
+        "fast": 2,
+        "slow": 3,
+        "hard": 4,
+        "deep": 5,
+    }
+    assert PASS_NUMBER_TO_NAME == {
+        1: "survey",
+        2: "fast",
+        3: "slow",
+        4: "hard",
+        5: "deep",
+    }
+
+
+def test_legacy_policy_with_a_high_slow_threshold_migrates_safely() -> None:
+    legacy = DEFAULT_POLICY.to_dict()
+    legacy["version"] = 1
+    legacy["slow_threshold"] = 30.0
+    legacy.pop("hard_threshold")
+
+    migrated = RecoveryPolicy.from_dict(legacy)
+
+    assert migrated.slow_threshold == 30.0
+    assert migrated.hard_threshold == 150.0
 
 
 def test_map_rejects_an_unknown_persisted_policy_field() -> None:

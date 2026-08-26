@@ -11,9 +11,10 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from .display import format_bytes, format_pass_label, format_status_view, tally_kinds
-from .mapfile import MapValidationError, load_map
+from .interrupts import StopController, two_stage_interrupts
+from .mapfile import MapValidationError, load_map, mark_map_range, save_map_atomic
 from .optimize import OptimizationPreference, OptimizationRecommendation, recommend_policy
-from .policy import DEFAULT_POLICY, PASS_NAME_TO_NUMBER, PASS_NUMBER_TO_NAME
+from .policy import DEFAULT_POLICY, PASS_ALIASES, PASS_NAME_TO_NUMBER, PASS_NUMBER_TO_NAME
 from .rescue import RescueResult, rescue
 from .version import __version__
 
@@ -63,7 +64,7 @@ def parse_positive_int(value: str) -> int:
     return parsed
 
 
-PASS_THROUGH_METAVAR = "{survey,fill,retry,deep,1,2,3,4}"
+PASS_THROUGH_METAVAR = "{survey,fast,slow,hard,deep,1,2,3,4,5}"
 
 
 def parse_through(value: str) -> int:
@@ -72,15 +73,17 @@ def parse_through(value: str) -> int:
     normalized = value.strip().lower()
     if normalized in PASS_NAME_TO_NUMBER:
         return PASS_NAME_TO_NUMBER[normalized]
+    if normalized in PASS_ALIASES:
+        return PASS_ALIASES[normalized]
     try:
         number = int(normalized, 10)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(
-            "through must be survey, fill, retry, deep, or 1 through 4"
+            "through must be survey, fast, slow, hard, deep, or 1 through 5"
         ) from exc
     if number not in PASS_NUMBER_TO_NAME:
         raise argparse.ArgumentTypeError(
-            "through must be survey, fill, retry, deep, or 1 through 4"
+            "through must be survey, fast, slow, hard, deep, or 1 through 5"
         )
     return number
 
@@ -93,9 +96,8 @@ def _add_through_options(parser: argparse.ArgumentParser) -> None:
         choices=tuple(PASS_NUMBER_TO_NAME),
         metavar=PASS_THROUGH_METAVAR,
         help=(
-            "last recovery stage: survey (whole-file coverage), fill (likely-good "
-            "gaps), retry (slow/error gaps), or deep (fine-grained recovery); "
-            "default: fill"
+            "last recovery stage: survey, fast, slow, hard, or deep; "
+            "legacy aliases fill=fast and retry=slow; default: fast"
         ),
     )
     selection.add_argument(
@@ -111,15 +113,15 @@ def _selected_max_pass(args: argparse.Namespace) -> int:
         return args.through
     if args.max_pass is not None:
         return args.max_pass
-    return PASS_NAME_TO_NUMBER["fill"]
+    return PASS_NAME_TO_NUMBER["fast"]
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="flvrescue",
         description=(
-            "Run Survey for whole-file coverage, then Fill likely-good gaps; "
-            "Retry and Deep are opt-in later stages. Sizes accept bytes or K/M/G/T suffixes "
+            "Run Survey for whole-file coverage, then recover Fast gaps; "
+            "Slow, Hard, and Deep are opt-in later stages. Sizes accept bytes or K/M/G/T suffixes "
             "(1024-based)."
         ),
         epilog=(
@@ -167,6 +169,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="advanced override for successful read duration treated as slow",
     )
     parser.add_argument(
+        "--slow-block",
+        type=parse_size,
+        default=None,
+        metavar="SIZE",
+        help="advanced Pass 3 read size override",
+    )
+    parser.add_argument(
+        "--hard-block",
+        type=parse_size,
+        default=None,
+        metavar="SIZE",
+        help="advanced Pass 4 read size override",
+    )
+    parser.add_argument(
+        "--hard-threshold",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="advanced override for successful read duration treated as hard",
+    )
+    for stage in ("survey", "fast", "slow", "hard", "deep"):
+        parser.add_argument(
+            f"--{stage}-budget",
+            type=float,
+            default=None,
+            metavar="SECONDS",
+            help=f"advanced maximum time for one {stage.title()} read",
+        )
+    parser.add_argument(
         "--checkpoint",
         type=parse_size,
         default=None,
@@ -209,6 +240,12 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "advanced override for Pass 1 sample stride; 0 disables sampling"
         ),
+    )
+    parser.add_argument(
+        "--reader",
+        choices=("auto", "windows", "portable"),
+        default="auto",
+        help="source I/O backend; auto uses cancellable Windows I/O when available",
     )
     _add_through_options(parser)
     return parser
@@ -295,7 +332,27 @@ def build_resume_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="suppress periodic progress output",
     )
+    parser.add_argument(
+        "--reader",
+        choices=("auto", "windows", "portable"),
+        default="auto",
+        help="source I/O backend; auto uses cancellable Windows I/O when available",
+    )
     _add_through_options(parser)
+    return parser
+
+
+def build_mark_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="flvrescue mark",
+        description="Change only a rescue map; source and destination files are not opened.",
+    )
+    parser.add_argument("map", help="exact .rescue.json map path")
+    parser.add_argument("--offset", type=parse_nonnegative_size, required=True)
+    parser.add_argument("--length", type=parse_size, required=True)
+    action = parser.add_mutually_exclusive_group(required=True)
+    action.add_argument("--as", dest="classification", choices=("slow", "hard", "defer"))
+    action.add_argument("--clear", dest="classification", action="store_const", const="clear")
     return parser
 
 
@@ -341,7 +398,8 @@ def run_status(argv: Sequence[str] | None = None) -> int:
         print(f"flvrescue: error: {exc}", file=sys.stderr)
         return 1
     ranges = tuple(
-        (item.offset, item.length, item.status, item.cause) for item in state.ranges
+        (item.offset, item.length, item.status, item.cause, item.difficulty)
+        for item in state.ranges
     )
     counts = tally_kinds(ranges, state.source_size)
     size = shutil.get_terminal_size(fallback=(80, 24))
@@ -362,27 +420,98 @@ def run_status(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
+def run_mark(argv: Sequence[str] | None = None) -> int:
+    parser = build_mark_parser()
+    args = parser.parse_args(argv)
+    map_path = Path(args.map).expanduser().resolve()
+    try:
+        if not map_path.is_file():
+            raise FileNotFoundError(f"rescue map does not exist: {map_path}")
+        state = load_map(map_path)
+        changed = mark_map_range(
+            state,
+            args.offset,
+            args.length,
+            args.classification,
+        )
+        if changed:
+            save_map_atomic(map_path, state)
+    except (OSError, TypeError, ValueError, MapValidationError) as exc:
+        print(f"flvrescue: error: {exc}", file=sys.stderr)
+        return 1
+
+    if changed:
+        print(
+            f"Marked {format_bytes(changed)} as {args.classification} in {map_path}"
+        )
+    else:
+        print("No unresolved manual classification changed.")
+    print("Source and destination files were not opened.")
+    return 0
+
+
 def _print_summary(result: RescueResult, *, through: int) -> None:
-    print("\nRescue run completed.")
+    print(
+        "\nRescue run stopped safely."
+        if getattr(result, "stopped", False)
+        else "\nRescue run completed."
+    )
     print(f"Target:           {result.destination}")
     print(f"Recovered:        {format_bytes(result.recovered_bytes)}")
-    print(f"Likely-good skip: {format_bytes(result.easy_skipped_bytes)}")
-    print(f"Slow/error skip:  {format_bytes(result.hard_skipped_bytes)}")
+    print(f"Likely-fast skip: {format_bytes(result.easy_skipped_bytes)}")
+    print(f"Recovered slow:   {format_bytes(getattr(result, 'slow_bytes', 0))}")
+    print(f"Recovered hard:   {format_bytes(getattr(result, 'hard_bytes', 0))}")
+    print(f"Slow skip:        {format_bytes(getattr(result, 'slow_skipped_bytes', 0))}")
+    print(f"Hard skip:        {format_bytes(result.hard_skipped_bytes)}")
+    print(f"Failure skip:     {format_bytes(getattr(result, 'failure_skipped_bytes', 0))}")
     print(f"Unreadable:       {format_bytes(result.unreadable_bytes)}")
     print(f"Unprocessed:      {format_bytes(result.unprocessed_bytes)}")
-    print(f"Completed through: {format_pass_label(through)}")
-    if result.current_pass <= 4:
+    if getattr(result, "stopped", False):
+        print(f"Stopped during:    {format_pass_label(min(result.current_pass, 5))}")
+        print(f"Requested through: {format_pass_label(through)}")
+    else:
+        print(f"Completed through: {format_pass_label(through)}")
+    if result.current_pass <= 5:
         print(f"Next pass:        {format_pass_label(result.current_pass)}")
     print(f"Resume map:       {result.map_path}")
+    if getattr(result, "cancellation_pending", False):
+        print(
+            "Warning: the cancelled OS/device request did not finish promptly; "
+            "physical disk activity may continue."
+        )
 
 
 def _validate_advanced_options(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if args.block is not None and args.slow_block is not None and args.block < args.slow_block:
+        parser.error("--block must not be smaller than --slow-block")
+    if args.slow_block is not None and args.hard_block is not None and args.slow_block < args.hard_block:
+        parser.error("--slow-block must not be smaller than --hard-block")
+    if args.hard_block is not None and args.sector is not None and args.hard_block < args.sector:
+        parser.error("--hard-block must not be smaller than --sector")
     if args.block is not None and args.fallback is not None and args.block < args.fallback:
         parser.error("--block must not be smaller than --fallback")
     if args.fallback is not None and args.sector is not None and args.fallback < args.sector:
         parser.error("--fallback must not be smaller than --sector")
     if args.slow_threshold is not None and args.slow_threshold <= 0:
         parser.error("--slow-threshold must be greater than zero")
+    if args.hard_threshold is not None and args.hard_threshold <= 0:
+        parser.error("--hard-threshold must be greater than zero")
+    if (
+        args.slow_threshold is not None
+        and args.hard_threshold is not None
+        and args.hard_threshold <= args.slow_threshold
+    ):
+        parser.error("--hard-threshold must be greater than --slow-threshold")
+    for name in (
+        "survey_budget",
+        "fast_budget",
+        "slow_budget",
+        "hard_budget",
+        "deep_budget",
+    ):
+        value = getattr(args, name)
+        if value is not None and value <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be greater than zero")
     if (
         args.skip_start is not None
         and args.skip_max is not None
@@ -394,10 +523,18 @@ def _validate_advanced_options(args: argparse.Namespace, parser: argparse.Argume
 def _advanced_rescue_kwargs(args: argparse.Namespace) -> dict[str, int | float | None]:
     return {
         "block_size": args.block,
+        "slow_block_size": args.slow_block,
+        "hard_block_size": args.hard_block,
         "fallback_size": args.fallback,
         "sector_size": args.sector,
         "checkpoint_interval": args.checkpoint,
         "slow_threshold": args.slow_threshold,
+        "hard_threshold": args.hard_threshold,
+        "survey_budget": args.survey_budget,
+        "fast_budget": args.fast_budget,
+        "slow_budget": args.slow_budget,
+        "hard_budget": args.hard_budget,
+        "deep_budget": args.deep_budget,
         "skip_start": args.skip_start,
         "skip_factor": args.skip_factor,
         "skip_max": args.skip_max,
@@ -415,8 +552,8 @@ def _choose_optimization_preference(
         return "balanced"
     print("Recovery preference:")
     print("  1) fast      - cover selected files first")
-    print("  2) balanced  - Survey then likely-readable Fill [default]")
-    print("  3) thorough  - smaller gaps and Retry when capacity permits")
+    print("  2) balanced  - Survey then likely-readable Fast [default]")
+    print("  3) thorough  - smaller gaps and Slow when capacity permits")
     answer = input("Choose 1-3 [2]: ").strip().lower()
     return {
         "1": "fast",
@@ -472,6 +609,8 @@ def _optimization_command(
             arguments.extend((option, str(value)))
     if policy.slow_threshold != DEFAULT_POLICY.slow_threshold:
         arguments.extend(("--slow-threshold", str(policy.slow_threshold)))
+    if policy.hard_threshold != DEFAULT_POLICY.hard_threshold:
+        arguments.extend(("--hard-threshold", str(policy.hard_threshold)))
     arguments.extend(("--through", recommendation.through))
     return " ".join(arguments)
 
@@ -562,14 +701,18 @@ def run_resume(argv: Sequence[str] | None = None) -> int:
                 file=sys.stderr,
             )
             policy = DEFAULT_POLICY
-        result = rescue(
-            state.source_path,
-            state.destination_path,
-            map_path=map_path,
-            progress=not args.no_progress,
-            policy=policy,
-            max_pass=through,
-        )
+        controller = StopController()
+        with two_stage_interrupts(controller):
+            result = rescue(
+                state.source_path,
+                state.destination_path,
+                map_path=map_path,
+                progress=not args.no_progress,
+                policy=policy,
+                max_pass=through,
+                reader_backend=args.reader,
+                stop_controller=controller,
+            )
     except KeyboardInterrupt:
         print("\nInterrupted. Output and resume map were checkpointed.", file=sys.stderr)
         return 0
@@ -588,22 +731,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_resume(argv_list[1:])
     if argv_list and argv_list[0] == "optimize":
         return run_optimize(argv_list[1:])
+    if argv_list and argv_list[0] == "mark":
+        return run_mark(argv_list[1:])
     parser = build_parser()
     args = parser.parse_args(argv)
     _validate_advanced_options(args, parser)
     through = _selected_max_pass(args)
     try:
-        result = rescue(
-            args.source,
-            args.destination,
-            map_path=args.map_path,
-            progress=not args.no_progress,
-            # Let the engine adopt DEFAULT_POLICY for a new run or the saved
-            # policy for a repeated-command resume.
-            policy=None,
-            max_pass=through,
-            **_advanced_rescue_kwargs(args),
-        )
+        controller = StopController()
+        with two_stage_interrupts(controller):
+            result = rescue(
+                args.source,
+                args.destination,
+                map_path=args.map_path,
+                progress=not args.no_progress,
+                # Let the engine adopt DEFAULT_POLICY for a new run or the saved
+                # policy for a repeated-command resume.
+                policy=None,
+                max_pass=through,
+                reader_backend=args.reader,
+                stop_controller=controller,
+                **_advanced_rescue_kwargs(args),
+            )
     except KeyboardInterrupt:
         print("\nInterrupted. Output and resume map were checkpointed.", file=sys.stderr)
         return 0

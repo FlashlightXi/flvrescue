@@ -10,13 +10,19 @@ import time
 from dataclasses import dataclass, replace
 from typing import Callable, TextIO
 
-from .display import format_live_lines, format_preparing_lines, tally_kinds
+from .display import (
+    format_live_header,
+    format_live_lines,
+    format_preparing_lines,
+    tally_kinds,
+)
 
 
 COLORS = {
     "normal": "\x1b[32m",
     "reading": "\x1b[36m",
     "slow": "\x1b[33m",
+    "hard": "\x1b[35m",
     "skip": "\x1b[33m",
     "error": "\x1b[31m",
     "complete": "\x1b[32m",
@@ -52,11 +58,19 @@ class ProgressSnapshot:
     unreadable: int = 0
     easy_skipped: int = 0
     hard_skipped: int = 0
-    ranges: tuple[tuple[int, int, str, str | None], ...] = ()
+    ranges: tuple[
+        tuple[int, int, str, str | None]
+        | tuple[int, int, str, str | None, str | None],
+        ...,
+    ] = ()
     status: str = "starting"
     read_offset: int | None = None
     read_size: int = 0
     read_started_at: float | None = None
+    section_start: int | None = None
+    section_end: int | None = None
+    slow_threshold: float = 2.0
+    hard_threshold: float = 10.0
     storage_mode: str | None = None
     allocated_bytes: int | None = None
 
@@ -116,7 +130,11 @@ class ProgressReporter:
         status: str,
         easy_skipped: int = 0,
         hard_skipped: int = 0,
-        ranges: tuple[tuple[int, int, str, str | None], ...] = (),
+        ranges: tuple[
+            tuple[int, int, str, str | None]
+            | tuple[int, int, str, str | None, str | None],
+            ...,
+        ] = (),
         storage_mode: str | None = None,
         allocated_bytes: int | None = None,
         force: bool = False,
@@ -148,7 +166,17 @@ class ProgressReporter:
         if force:
             self._wake.set()
 
-    def begin_read(self, offset: int, size: int, *, status: str = "reading") -> None:
+    def begin_read(
+        self,
+        offset: int,
+        size: int,
+        *,
+        status: str = "reading",
+        section_start: int | None = None,
+        section_end: int | None = None,
+        slow_threshold: float = 2.0,
+        hard_threshold: float = 10.0,
+    ) -> None:
         with self._lock:
             self._snapshot = replace(
                 self._snapshot,
@@ -156,7 +184,16 @@ class ProgressReporter:
                 read_offset=offset,
                 read_size=size,
                 read_started_at=self._clock(),
+                section_start=section_start,
+                section_end=section_end,
+                slow_threshold=slow_threshold,
+                hard_threshold=hard_threshold,
             )
+
+    def set_read_status(self, status: str) -> None:
+        with self._lock:
+            self._snapshot = replace(self._snapshot, status=status)
+        self._wake.set()
 
     def end_read(self, *, status: str) -> None:
         with self._lock:
@@ -166,7 +203,15 @@ class ProgressReporter:
                 read_offset=None,
                 read_size=0,
                 read_started_at=None,
+                section_start=None,
+                section_end=None,
             )
+
+    def announce_pass(self, pass_number: int) -> None:
+        self.event(
+            "normal",
+            format_live_header(self.label, self.total, current_pass=pass_number),
+        )
 
     def event(self, kind: str, message: str) -> None:
         with self._lock:
@@ -204,14 +249,24 @@ class ProgressReporter:
                 allocated_bytes=snapshot.allocated_bytes,
             )
         counts = tally_kinds(snapshot.ranges, snapshot.total)
-        if snapshot.ranges or snapshot.recovered or snapshot.easy_skipped:
-            counts["good"] = snapshot.recovered
-            counts["fast"] = snapshot.easy_skipped
-            counts["slow"] = snapshot.hard_skipped
-            counts["bad"] = snapshot.unreadable
-            counted = counts["good"] + counts["fast"] + counts["slow"] + counts["bad"]
-            counts["pending"] = max(0, snapshot.total - counted)
         width = max(40, shutil.get_terminal_size(fallback=(100, 24)).columns)
+        read_elapsed = (
+            max(0.0, now - snapshot.read_started_at)
+            if snapshot.read_started_at is not None
+            else 0.0
+        )
+        read_status = snapshot.status
+        if snapshot.read_started_at is not None and snapshot.status not in {
+            "cancel requested",
+            "cancelled",
+            "cancel pending",
+        }:
+            if read_elapsed >= snapshot.hard_threshold:
+                read_status = "hard"
+            elif read_elapsed >= snapshot.slow_threshold:
+                read_status = "slow"
+            else:
+                read_status = "reading"
         return format_live_lines(
             name=self.label,
             total=snapshot.total,
@@ -220,6 +275,14 @@ class ProgressReporter:
             width=width,
             color=self._tty,
             current_pass=snapshot.current_pass,
+            recovered=snapshot.recovered,
+            ranges=snapshot.ranges,
+            read_offset=snapshot.read_offset,
+            read_size=snapshot.read_size,
+            read_elapsed=read_elapsed,
+            read_status=read_status,
+            section_start=snapshot.section_start,
+            section_end=snapshot.section_end,
         )
 
     def _render(self, *, final: bool = False) -> None:

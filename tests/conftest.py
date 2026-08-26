@@ -78,3 +78,46 @@ class SlowInjectingReader(FaultInjectingReader):
         if any(offset < item.end and item.offset < end for item in self.slow_ranges):
             time.sleep(self.delay)
         return super().read_at(offset, size)
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+
+class LatencyInjectingReader(FaultInjectingReader):
+    """Deterministic Reader whose intersecting ranges advance a fake clock."""
+
+    def __init__(
+        self,
+        data: bytes,
+        clock: FakeClock,
+        latency_ranges: Iterable[tuple[int, int, float]],
+        *,
+        bad_ranges: Iterable[tuple[int, int]] = (),
+    ) -> None:
+        super().__init__(data, bad_ranges)
+        self.clock = clock
+        self.latency_ranges = tuple(
+            (ByteRange(offset, length), latency)
+            for offset, length, latency in latency_ranges
+        )
+
+    def read_at(self, offset: int, size: int) -> bytes:
+        end = offset + size
+        latency = max(
+            (
+                seconds
+                for item, seconds in self.latency_ranges
+                if offset < item.end and item.offset < end
+            ),
+            default=0.0,
+        )
+        self.clock.advance(latency)
+        return super().read_at(offset, size)

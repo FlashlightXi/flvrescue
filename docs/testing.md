@@ -10,7 +10,7 @@ py -m pytest
 py -m flvrescue optimize --help
 ```
 
-The tests use injectable Readers that either raise `OSError` or delay reads intersecting configured ranges. This tests error and slow-read strategy changes rather than merely changing readable file bytes.
+The tests use injectable Readers that raise `OSError`, really delay selected reads, or deterministically advance a fake clock for fast/slow/hard regions. This tests latency-priority behavior without making the suite wait for long reads.
 
 Coverage includes:
 
@@ -19,14 +19,18 @@ Coverage includes:
 - Fast Pass continuation over normal ranges without fallback reads
 - Slow detection, adaptive skip growth, skip-reset hysteresis, and normal-region rediscovery
 - Pass 1 optional survey stride for whole-file sampling
-- Pass 2 Fill of likely-good survey skips; Pass 3 Retry of remaining slow/error skips
-- Optional Pass 4 Deep localization through block, fallback, and sector sizes
+- Pass 2 Fast of likely-fast survey skips and Pass 3 Slow without hard-region pursuit
+- Bounded Pass 4 Hard attempts and optional Pass 5 Deep block/fallback/sector localization
+- Per-pass read-budget deferral, completed and still-pending cancellation, and no new read after a stop request
+- Windows overlapped explicit-offset reads and an end-to-end Windows backend rescue
 - Saved policy validation, legacy-policy adoption, and strict `resume` destination/map matching
 - `flvrescue status` occupancy rendering and pass labels from a saved map
 - Range splitting, merging, and zero-filling of final unreadable units
 - Ctrl+C checkpointing and resume without rereading recovered ranges
-- Safe migration of v1 prefix maps to the v2 range map
+- Safe migration of v1 prefix and v2 range maps to map v3, including policy v1/v2 to v3
 - Progress updates while a simulated source read is blocked, and destination preparation without a fake percent
+- Local read-marker alignment, color-independent glyphs, and timed Slow/Hard display states
+- Manual Slow/Hard/Deep routing that changes only unresolved map ranges
 - Malformed or mismatched maps and unsafe path aliases
 - Generated FLV fixtures and FFmpeg decode checks
 

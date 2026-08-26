@@ -13,18 +13,23 @@ from math import isfinite
 from typing import Any, Final
 
 
-POLICY_VERSION: Final = 1
+POLICY_VERSION: Final = 3
 PROFILE_COVERAGE: Final = "coverage"
+LEGACY_POLICY_VERSION: Final = 1
+FIVE_PASS_POLICY_VERSION: Final = 2
+DEFAULT_HARD_THRESHOLD: Final = 10.0
 
 PASS_NAME_TO_NUMBER: Final[dict[str, int]] = {
     "survey": 1,
-    "fill": 2,
-    "retry": 3,
-    "deep": 4,
+    "fast": 2,
+    "slow": 3,
+    "hard": 4,
+    "deep": 5,
 }
 PASS_NUMBER_TO_NAME: Final[dict[int, str]] = {
     number: name for name, number in PASS_NAME_TO_NUMBER.items()
 }
+PASS_ALIASES: Final[dict[str, int]] = {"fill": 2, "retry": 3}
 
 
 def _positive_int(value: object, name: str) -> int:
@@ -46,15 +51,23 @@ def _positive_number(value: object, name: str) -> float:
 
 @dataclass(frozen=True)
 class RecoveryPolicy:
-    """The versioned, durable strategy for the four recovery passes."""
+    """The versioned, durable strategy for the five recovery passes."""
 
     version: int = POLICY_VERSION
     profile: str = PROFILE_COVERAGE
     block: int = 8 * 1024 * 1024
+    slow_block: int = 1024 * 1024
+    hard_block: int = 64 * 1024
     fallback: int = 64 * 1024
     sector: int = 4 * 1024
     checkpoint: int = 64 * 1024 * 1024
     slow_threshold: float = 2.0
+    hard_threshold: float = DEFAULT_HARD_THRESHOLD
+    survey_budget: float = 5.0
+    fast_budget: float = 5.0
+    slow_budget: float = 30.0
+    hard_budget: float = 120.0
+    deep_budget: float = 600.0
     skip_start: int = 128 * 1024 * 1024
     skip_max: int = 1024 * 1024 * 1024
     skip_factor: int = 2
@@ -70,6 +83,8 @@ class RecoveryPolicy:
             raise ValueError(f"unsupported recovery policy profile {self.profile!r}")
         for name in (
             "block",
+            "slow_block",
+            "hard_block",
             "fallback",
             "sector",
             "checkpoint",
@@ -86,8 +101,33 @@ class RecoveryPolicy:
         ):
             raise ValueError("policy survey_stride must be a non-negative integer")
         _positive_number(self.slow_threshold, "slow_threshold")
-        if self.block < self.fallback or self.fallback < self.sector:
-            raise ValueError("policy requires block >= fallback >= sector")
+        _positive_number(self.hard_threshold, "hard_threshold")
+        for name in (
+            "survey_budget",
+            "fast_budget",
+            "slow_budget",
+            "hard_budget",
+            "deep_budget",
+        ):
+            _positive_number(getattr(self, name), name)
+        if self.hard_threshold <= self.slow_threshold:
+            raise ValueError("policy hard_threshold must be greater than slow_threshold")
+        if not (
+            self.block >= self.fallback >= self.sector
+            and self.slow_block >= self.hard_block >= self.sector
+        ):
+            raise ValueError(
+                "policy requires block >= fallback >= sector and "
+                "slow_block >= hard_block >= sector"
+            )
+        if not (
+            self.survey_budget <= self.slow_budget
+            and self.fast_budget <= self.slow_budget
+            and self.slow_budget <= self.hard_budget <= self.deep_budget
+        ):
+            raise ValueError(
+                "policy read budgets must increase from Survey/Fast through Slow, Hard, and Deep"
+            )
         if self.skip_start > self.skip_max:
             raise ValueError("policy skip_start must not exceed skip_max")
 
@@ -122,10 +162,18 @@ class RecoveryPolicy:
             "version": self.version,
             "profile": self.profile,
             "block": self.block,
+            "slow_block": self.slow_block,
+            "hard_block": self.hard_block,
             "fallback": self.fallback,
             "sector": self.sector,
             "checkpoint": self.checkpoint,
             "slow_threshold": self.slow_threshold,
+            "hard_threshold": self.hard_threshold,
+            "survey_budget": self.survey_budget,
+            "fast_budget": self.fast_budget,
+            "slow_budget": self.slow_budget,
+            "hard_budget": self.hard_budget,
+            "deep_budget": self.deep_budget,
             "skip_start": self.skip_start,
             "skip_max": self.skip_max,
             "skip_factor": self.skip_factor,
@@ -148,23 +196,68 @@ class RecoveryPolicy:
             "version",
             "profile",
             "block",
+            "slow_block",
+            "hard_block",
             "fallback",
             "sector",
             "checkpoint",
             "slow_threshold",
+            "hard_threshold",
+            "survey_budget",
+            "fast_budget",
+            "slow_budget",
+            "hard_budget",
+            "deep_budget",
             "skip_start",
             "skip_max",
             "skip_factor",
             "skip_reset_after",
             "survey_stride",
         }
-        missing = expected.difference(value)
+        raw = dict(value)
+        version = raw.get("version")
+        new_fields = {
+            "slow_block",
+            "hard_block",
+            "survey_budget",
+            "fast_budget",
+            "slow_budget",
+            "hard_budget",
+            "deep_budget",
+        }
+        if version == LEGACY_POLICY_VERSION:
+            required = expected - new_fields - {"hard_threshold"}
+            allowed = expected - {"hard_threshold"}
+            missing = required.difference(raw)
+            unknown = set(raw).difference(allowed)
+            if missing:
+                raise ValueError(f"policy is missing fields: {', '.join(sorted(missing))}")
+            if unknown:
+                raise ValueError(f"policy has unknown fields: {', '.join(sorted(unknown))}")
+            legacy_slow = _positive_number(raw["slow_threshold"], "slow_threshold")
+            raw["hard_threshold"] = max(
+                DEFAULT_HARD_THRESHOLD, legacy_slow * 5.0
+            )
+        elif version == FIVE_PASS_POLICY_VERSION:
+            required = expected - new_fields
+            missing = required.difference(raw)
+            unknown = set(raw).difference(expected)
+            if missing:
+                raise ValueError(f"policy is missing fields: {', '.join(sorted(missing))}")
+            if unknown:
+                raise ValueError(f"policy has unknown fields: {', '.join(sorted(unknown))}")
+        if version in (LEGACY_POLICY_VERSION, FIVE_PASS_POLICY_VERSION):
+            defaults = cls()
+            raw["version"] = POLICY_VERSION
+            for name in new_fields:
+                raw.setdefault(name, getattr(defaults, name))
+        missing = expected.difference(raw)
         if missing:
             raise ValueError(f"policy is missing fields: {', '.join(sorted(missing))}")
-        unknown = set(value).difference(expected)
+        unknown = set(raw).difference(expected)
         if unknown:
             raise ValueError(f"policy has unknown fields: {', '.join(sorted(unknown))}")
-        return cls(**{name: value[name] for name in expected})  # type: ignore[arg-type]
+        return cls(**{name: raw[name] for name in expected})  # type: ignore[arg-type]
 
     def with_overrides(self, **overrides: object) -> "RecoveryPolicy":
         """Return a validated copy with explicitly supplied policy fields."""
@@ -174,6 +267,24 @@ class RecoveryPolicy:
         if unknown:
             raise ValueError(f"unknown policy overrides: {', '.join(sorted(unknown))}")
         return replace(self, **overrides)  # type: ignore[arg-type]
+
+    def block_for_pass(self, pass_number: int) -> int:
+        if pass_number <= 2:
+            return self.block
+        if pass_number == 3:
+            return min(self.block, self.slow_block)
+        if pass_number == 4:
+            return min(self.block, self.hard_block)
+        return self.block
+
+    def budget_for_pass(self, pass_number: int) -> float:
+        return {
+            1: self.survey_budget,
+            2: self.fast_budget,
+            3: self.slow_budget,
+            4: self.hard_budget,
+            5: self.deep_budget,
+        }.get(pass_number, self.deep_budget)
 
 
 DEFAULT_POLICY: Final = RecoveryPolicy()

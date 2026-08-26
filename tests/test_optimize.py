@@ -6,7 +6,7 @@ from flvrescue.optimize import recommend_policy
 def test_balanced_medium_file_keeps_tested_default_geometry() -> None:
     recommendation = recommend_policy(76 * 1024**3, preference="balanced")
 
-    assert recommendation.through == "fill"
+    assert recommendation.through == "fast"
     assert recommendation.policy.block == 8 * 1024**2
     assert recommendation.policy.survey_stride == 128 * 1024**2
     assert recommendation.policy.skip_start == 128 * 1024**2

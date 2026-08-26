@@ -12,13 +12,13 @@ It recovers fast, readable ranges before revisiting slow or failed regions. The 
 Python 3.11 or newer is required. Runtime dependencies are limited to the standard library.
 
 ```powershell
-py -m pip install .
+py -m pip install flvrescue==0.3.0
 flvrescue optimize damaged.flv rescued.flv
-flvrescue damaged.flv rescued.flv --through survey
-flvrescue resume rescued.flv --through fill
+flvrescue damaged.flv rescued.flv
+flvrescue resume rescued.flv --through slow
 ```
 
-The source is opened read-only. The default coverage policy makes Pass 1 sample the whole file, then Pass 2 fill likely-good gaps. Resume state is saved beside the output as `rescued.flv.rescue.json`.
+The source is opened read-only. By default, Pass 1 surveys the whole file and Pass 2 recovers likely-fast gaps. Resume state is saved beside the output as `rescued.flv.rescue.json`.
 
 If the operation is interrupted, use `flvrescue resume rescued.flv`. The saved source path, destination path, and policy are validated before recovery continues, and committed recovered ranges are not read again.
 
@@ -26,15 +26,16 @@ If the operation is interrupted, use `flvrescue resume rescued.flv`. The saved s
 
 ## Main features
 
-- Pass 1 Survey samples the whole file; Pass 2 Fill reads likely-good gaps
-- Pass 3 Retry tries slow/error gaps once more; Pass 4 Deep localizes stubborn gaps
+- Five passes prioritize Survey, Fast, Slow, Hard, then opt-in Deep recovery
+- Successful reads retain fast/slow/hard difficulty in the range map
 - A saved, versioned coverage policy keeps resumed behavior stable
 - Non-mutating `optimize` recommendations for file size, free space, and priority
 - `flvrescue status` occupancy view that does not read the source drive
 - One source read at a time; no parallel reads against the failing disk
-- Range-based atomic JSON map with v1 map migration
+- Range-based atomic JSON map with safe v1/v2 migration
 - Ctrl+C checkpointing and resumable partial output
-- Threaded ANSI Live progress that continues while a source read is blocked
+- Cancellable Windows reads with saved, per-pass time budgets
+- Threaded ANSI Live progress with a local offset bar while a source read is blocked
 - Injectable Reader API for deterministic I/O-error testing
 
 ## Common commands
@@ -43,11 +44,14 @@ If the operation is interrupted, use `flvrescue resume rescued.flv`. The saved s
 # First, distribute time across the selected files.
 flvrescue damaged.flv rescued.flv --through survey
 
-# Then fill the gaps that were likely readable.
-flvrescue resume rescued.flv --through fill
+# Default: Survey, then recover likely-fast gaps.
+flvrescue damaged.flv rescued.flv
 
-# Spend remaining time only on the most valuable files.
-flvrescue resume rescued.flv --through retry
+# Add a relatively safe slow-region pass.
+flvrescue resume rescued.flv --through slow
+
+# Explicitly spend more drive time on valuable files.
+flvrescue resume rescued.flv --through hard
 flvrescue resume rescued.flv --through deep
 
 # Choose a non-default sidecar path when starting a new rescue.
@@ -55,18 +59,22 @@ flvrescue damaged.flv rescued.flv --map rescued.map.json --through survey
 
 # Inspect a map without touching the failing drive
 flvrescue status rescued.flv
+
+# Route only unresolved bytes in a map to Deep; source and output stay unopened
+flvrescue mark rescued.flv.rescue.json --offset 48G --length 512M --as defer
 ```
 
 The default recovery flow is:
 
 ```text
 Pass 1 Survey: sample the whole file and preserve fast data
-Pass 2 Fill: read likely-good survey gaps
-Pass 3 Retry: try slow/error gaps again without deep localization
-Pass 4 Deep: use progressively smaller reads for selected stubborn gaps
+Pass 2 Fast: read likely-fast survey gaps without pursuing slow areas
+Pass 3 Slow: recover light-slow areas and Fast-pass leftovers
+Pass 4 Hard: make one bounded coarse attempt per hard/error block
+Pass 5 Deep: exhaustively localize every unresolved range
 ```
 
-For a limited SSD, work on a group of files that fits: Survey each file, Fill each file, then move the recovered files away before starting the next group. Leave Retry and Deep until overall coverage is secured.
+For a limited SSD, work on a group of files that fits: run the default Survey→Fast flow, move those outputs away, and then start the next group. Leave Slow, Hard, and especially Deep until broad coverage is secured. The legacy names `fill` and `retry` remain aliases for `fast` and `slow`.
 
 ## Documentation
 
@@ -81,7 +89,7 @@ py -m pip install -e ".[test]"
 py -m pytest
 ```
 
-`flvrescue` is currently Windows-focused and intentionally limited to ordinary files. It does not perform raw-device cloning, filesystem repair, SMART operations, forced read cancellation, or concurrent source reads.
+On Windows, the default reader uses cancellable overlapped I/O and explicit file offsets. The portable fallback remains serial and safe to resume, but an operating-system read already in progress cannot be cancelled by Python. `flvrescue` is intentionally limited to ordinary files; it does not perform raw-device cloning, filesystem repair, SMART operations, or concurrent source reads.
 
 ## License
 

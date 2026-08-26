@@ -2,7 +2,7 @@
 
 ## What flvrescue does
 
-`flvrescue` reads one ordinary file with one source request at a time and writes the result to a different file. Pass 1 Survey samples across the file, Pass 2 Fill revisits likely-good survey skips, Pass 3 Retry tries slow/error ranges again, and Pass 4 Deep narrows selected unresolved ranges to smaller reads. Unrecovered ranges remain zero-filled so later readable data keeps its original offset.
+`flvrescue` reads one ordinary file with one source request at a time and writes the result to a different file. Survey samples the file, Fast recovers likely-fast gaps, Slow handles light-slow ranges, Hard gives hard/error blocks one coarse attempt, and explicit Deep localizes every unresolved range. Unrecovered ranges remain zero-filled so later readable data keeps its original offset.
 
 The source file is never opened for writing.
 
@@ -14,18 +14,20 @@ The source file is never opened for writing.
 - Recover bytes that the operating system cannot read
 - Clone a disk or access raw sectors
 - Inspect or change SMART settings
-- Impose a reliable timeout or forcibly cancel an in-progress synchronous read
+- Guarantee that cancelling a Windows request immediately stops lower-level drive or controller activity
 - Guarantee that a zero-filled FLV remains decodable
 
 It is complementary to, not a replacement for, device-level recovery tools such as GNU ddrescue. Use a physical-media imaging workflow when a disk or partition image, reverse passes, or broader retry control is required.
 
-## Blocking I/O limitation
+## Read cancellation boundary
 
-Python's ordinary `read()` may remain blocked while Windows, a storage driver, USB bridge, or the drive firmware performs its own retries. The slow threshold changes strategy only after that read returns; it is not an I/O timeout.
+On Windows, the default backend uses one explicit-offset overlapped `ReadFile` request at a time. Each pass has a saved per-read time budget. When the budget expires or Ctrl+C requests a stop, `flvrescue` calls `CancelIoEx` for that request and waits briefly for Windows to acknowledge completion.
 
-The renderer runs separately and continues updating from shared state while normal file I/O is blocked. Ctrl+C checkpointing can still be delayed until control returns to Python. `flvrescue` does not kill an I/O worker thread because doing so is not a safe general cancellation mechanism.
+Windows request cancellation is not a physical-device guarantee. A storage driver, USB bridge, or drive firmware may continue lower-level work after Windows reports cancellation. If cancellation is still pending after the grace period, `flvrescue` checkpoints and starts no further reads; it keeps the native request storage alive until process exit rather than releasing memory still owned by the kernel.
 
-A future native Windows reader may use `CreateFileW`, `ReadFile`, and carefully scoped `CancelIoEx` handling. That requires separate validation of handle ownership, cancellation races, alignment, and device behavior.
+Pass 4 performs no fallback or sector localization and makes one attempt per coarse block. Pass 5 is the only exhaustive fallback stage and is never selected by default or by `optimize`.
+
+The renderer runs separately and continues updating from shared state while a read is pending. On non-Windows systems, or when `--reader portable` is selected, ordinary blocking reads cannot be cancelled by Python; checkpointing occurs once control returns.
 
 ## Destination storage and SSD capacity
 
@@ -49,6 +51,6 @@ Keep the source and destination files in place until that rescue is finished. Re
 
 ## Interruption behavior
 
-On Ctrl+C, `flvrescue` flushes committed destination writes and atomically updates the range map before the CLI exits. A lower-level I/O request may still delay when Ctrl+C reaches Python.
+The first Ctrl+C asks the active Windows read to cancel, prevents any new source read, flushes committed destination writes, and atomically updates the range map before normal CLI exit. The second Ctrl+C forces immediate process exit and therefore cannot promise another checkpoint or physical I/O quiescence. Use it only when waiting is riskier than losing the latest uncommitted progress.
 
 After an unexpected crash, the destination can contain writes not yet advertised by the map. Resume trusts only committed range state and safely overwrites any uncommitted data when that range is processed again.

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.0 - 2026-08-26
+
+- Split recovery into Survey, Fast, Slow, Hard, and opt-in Deep passes.
+- Add persisted slow/hard latency thresholds and per-range difficulty metadata.
+- Migrate map v1/v2 and policy v1 without rereading already recovered bytes.
+- Keep `fill` and `retry` as compatibility aliases for `fast` and `slow`.
+- Show fast, slow, hard, failure, and remaining occupancy separately.
+- Keep the default execution limit at Survey through Fast; Hard and Deep remain explicit.
+- Add Windows overlapped reads with per-pass time budgets and bounded cancellation.
+- Add two-stage Ctrl+C handling: checkpointed stop first, immediate process exit second.
+- Add smaller Slow and Hard read blocks while preserving serial, explicit-offset source I/O.
+- Add the live local offset bar, current-read marker, elapsed read state, and color-independent glyphs.
+- Add `flvrescue mark` to route unresolved map ranges to Slow, Hard, or Deep without opening source or destination data.
+
 ## 0.2.0 - 2026-08-24
 
 - Define Survey, Fill, Retry, and Deep as four named recovery stages.

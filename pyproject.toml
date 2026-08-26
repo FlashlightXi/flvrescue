@@ -1,25 +1,32 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "flvrescue"
-version = "0.2.0"
+version = "0.3.0"
 description = "Fault-tolerant recovery of readable data from large FLV recordings on failing drives"
 readme = "README.md"
 requires-python = ">=3.11"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{name = "flvrescue contributors"}]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",
-  "License :: OSI Approved :: MIT License",
   "Operating System :: Microsoft :: Windows",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: System :: Recovery Tools",
 ]
+
+[project.urls]
+Homepage = "https://github.com/FlashlightXi/flvrescue"
+Repository = "https://github.com/FlashlightXi/flvrescue"
+Issues = "https://github.com/FlashlightXi/flvrescue/issues"
 
 [project.scripts]
 flvrescue = "flvrescue.cli:main"

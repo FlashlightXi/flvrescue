@@ -312,3 +312,5 @@ Live表示を壊さずイベント履歴を表示できる構成にしてくだ�
 
 
 
+> [!NOTE]
+> This is the historical pre-v0.3.0 design record. The active implementation uses the five-pass Survey / Fast / Slow / Hard / Deep strategy documented in `README.md` and `docs/usage.md`.

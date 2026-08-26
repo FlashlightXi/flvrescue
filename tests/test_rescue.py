@@ -96,10 +96,15 @@ def test_normal_copy_preserves_bytes_and_finishes_default_two_passes(tmp_path: P
     assert result.current_pass == 3
     assert result.recovered_bytes == len(payload)
     map_data = read_map(map_path)
-    assert map_data["version"] == 2
+    assert map_data["version"] == 3
     assert map_data["current_pass"] == 3
     assert map_data["ranges"] == [
-        {"offset": 0, "length": len(payload), "status": "recovered"}
+        {
+            "offset": 0,
+            "length": len(payload),
+            "status": "recovered",
+            "difficulty": "fast",
+        }
     ]
 
 
@@ -217,13 +222,13 @@ def test_pass3_is_optional_and_localizes_unreadable_block(tmp_path: Path) -> Non
         destination,
         map_path=map_path,
         reader=deep_reader,
-        max_pass=4,
+        max_pass=5,
     )
     expected = bytearray(payload)
     expected[10:12] = b"\0\0"
     assert destination.read_bytes() == bytes(expected)
     assert [(item.offset, item.length) for item in after_deep.bad_ranges] == [(10, 2)]
-    assert after_deep.current_pass == 5
+    assert after_deep.current_pass == 6
 
 
 def test_resume_does_not_reread_committed_recovered_range(tmp_path: Path) -> None:
@@ -295,7 +300,7 @@ def test_v1_map_is_migrated_without_rereading_completed_prefix(
     )
 
     assert reader.calls[0] == (32, 32)
-    assert read_map(map_path)["version"] == 2
+    assert read_map(map_path)["version"] == 3
     assert read_map(map_path)["policy"]["profile"] == "coverage"
     assert destination.read_bytes()[:10] == payload[:10]
     assert destination.read_bytes()[10:12] == b"\0\0"
@@ -405,11 +410,16 @@ def test_pass2_stops_only_the_current_survey_hole_on_error(tmp_path: Path) -> No
 
     assert reader.calls == [(32, 32), (128, 32)]
     assert result.easy_skipped_bytes == 0
-    assert [(item.offset, item.length, item.status, item.cause) for item in result.ranges] == [
-        (0, 32, "recovered", None),
-        (32, 32, "unreadable", "read_error"),
-        (64, 32, "skipped", "read_error"),
-        (96, 96, "recovered", None),
+    assert [
+        (item.offset, item.length, item.status, item.cause, item.difficulty)
+        for item in result.ranges
+    ] == [
+        (0, 32, "recovered", None, None),
+        (32, 32, "unreadable", "read_error", "failure"),
+        (64, 32, "skipped", "read_error", "failure"),
+        (96, 32, "recovered", None, None),
+        (128, 32, "recovered", None, "fast"),
+        (160, 32, "recovered", None, None),
     ]
 
 
@@ -652,7 +662,8 @@ def test_pass2_fills_survey_gaps_before_slow_skips(tmp_path: Path) -> None:
     assert second_reader.calls[0] == (128, 32)
     assert all(call[0] != 32 for call in second_reader.calls)
     assert result.easy_skipped_bytes == 0
-    assert result.hard_skipped_bytes == 32
+    assert result.slow_skipped_bytes == 32
+    assert result.hard_skipped_bytes == 0
     hard = next(item for item in result.ranges if item.status == "skipped")
     assert hard.offset == 32
     assert hard.cause == "slow"

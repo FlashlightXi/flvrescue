@@ -12,9 +12,11 @@ from typing import Any, Iterable, Literal
 from .policy import RecoveryPolicy
 
 
-MAP_VERSION = 2
+MAP_VERSION = 3
 RangeStatus = Literal["recovered", "skipped", "unreadable", "unprocessed"]
+RangeDifficulty = Literal["fast", "slow", "hard", "failure"]
 RANGE_STATUSES = frozenset({"recovered", "skipped", "unreadable", "unprocessed"})
+RANGE_DIFFICULTIES = frozenset({"fast", "slow", "hard", "failure"})
 
 
 class MapValidationError(ValueError):
@@ -27,6 +29,7 @@ class RecoveryRange:
     length: int
     status: RangeStatus = "unreadable"
     cause: str | None = None
+    difficulty: RangeDifficulty | None = None
 
     @property
     def end(self) -> int:
@@ -40,11 +43,14 @@ class RecoveryRange:
         }
         if self.cause is not None:
             value["cause"] = self.cause
+        if self.difficulty is not None:
+            value["difficulty"] = self.difficulty
         return value
 
 
 # Public compatibility alias for callers that imported BadRange in v1.
 BadRange = RecoveryRange
+ManualClassification = Literal["slow", "hard", "defer", "clear"]
 
 
 def _is_int(value: object) -> bool:
@@ -71,6 +77,11 @@ def merge_ranges(ranges: Iterable[RecoveryRange]) -> list[RecoveryRange]:
             raise MapValidationError(f"unsupported range status {current.status!r}")
         if current.cause is not None and not isinstance(current.cause, str):
             raise MapValidationError("range cause must be a string or null")
+        if (
+            current.difficulty is not None
+            and current.difficulty not in RANGE_DIFFICULTIES
+        ):
+            raise MapValidationError("range difficulty is invalid")
         if merged and current.offset < merged[-1].end:
             raise MapValidationError("recovery ranges overlap")
         if (
@@ -78,6 +89,7 @@ def merge_ranges(ranges: Iterable[RecoveryRange]) -> list[RecoveryRange]:
             and current.offset == merged[-1].end
             and current.status == merged[-1].status
             and current.cause == merged[-1].cause
+            and current.difficulty == merged[-1].difficulty
         ):
             previous = merged[-1]
             merged[-1] = RecoveryRange(
@@ -85,6 +97,7 @@ def merge_ranges(ranges: Iterable[RecoveryRange]) -> list[RecoveryRange]:
                 previous.length + current.length,
                 previous.status,
                 previous.cause,
+                previous.difficulty,
             )
         else:
             merged.append(current)
@@ -117,8 +130,8 @@ class RescueMap:
         if not isinstance(self.destination_path, str) or not self.destination_path:
             raise MapValidationError("destination_path must be a non-empty string")
         _require_nonnegative_int(self.source_size, "source_size")
-        if not _is_int(self.current_pass) or not 1 <= self.current_pass <= 5:
-            raise MapValidationError("current_pass must be between 1 and 5")
+        if not _is_int(self.current_pass) or not 1 <= self.current_pass <= 6:
+            raise MapValidationError("current_pass must be between 1 and 6")
         _require_nonnegative_int(self.pass_cursor, "pass_cursor")
         _require_nonnegative_int(self.adaptive_skip, "adaptive_skip")
         if self.policy is not None and not isinstance(self.policy, RecoveryPolicy):
@@ -127,6 +140,18 @@ class RescueMap:
             raise MapValidationError("pass_cursor exceeds source_size")
 
         self.ranges = merge_ranges(self.ranges)
+        if self.current_pass == 6:
+            if self.pass_cursor != self.source_size:
+                raise MapValidationError(
+                    "completed map pass_cursor must equal source_size"
+                )
+            if any(
+                item.status not in ("recovered", "unreadable")
+                for item in self.ranges
+            ):
+                raise MapValidationError(
+                    "completed map cannot contain skipped or unprocessed ranges"
+                )
         if self.source_size == 0:
             if self.ranges:
                 raise MapValidationError("an empty source cannot have recovery ranges")
@@ -147,6 +172,7 @@ class RescueMap:
         length: int,
         status: RangeStatus,
         cause: str | None = None,
+        difficulty: RangeDifficulty | None = None,
     ) -> None:
         """Replace a covered interval, splitting existing ranges as needed."""
 
@@ -156,6 +182,8 @@ class RescueMap:
             raise ValueError("replacement range is outside the source")
         if status not in RANGE_STATUSES:
             raise ValueError(f"unsupported range status {status!r}")
+        if difficulty is not None and difficulty not in RANGE_DIFFICULTIES:
+            raise ValueError(f"unsupported range difficulty {difficulty!r}")
         end = offset + length
         replacement: list[RecoveryRange] = []
         inserted = False
@@ -165,13 +193,25 @@ class RescueMap:
                 continue
             if item.offset < offset:
                 replacement.append(
-                    RecoveryRange(item.offset, offset - item.offset, item.status, item.cause)
+                    RecoveryRange(
+                        item.offset,
+                        offset - item.offset,
+                        item.status,
+                        item.cause,
+                        item.difficulty,
+                    )
                 )
             if not inserted:
-                replacement.append(RecoveryRange(offset, length, status, cause))
+                replacement.append(
+                    RecoveryRange(offset, length, status, cause, difficulty)
+                )
                 inserted = True
             if item.end > end:
-                replacement.append(RecoveryRange(end, item.end - end, item.status, item.cause))
+                replacement.append(
+                    RecoveryRange(
+                        end, item.end - end, item.status, item.cause, item.difficulty
+                    )
+                )
         if not inserted:
             raise ValueError("replacement range is not covered by the map")
         self.ranges = merge_ranges(replacement)
@@ -210,11 +250,49 @@ class RescueMap:
 
     @property
     def easy_skipped_bytes(self) -> int:
-        return self.skipped_bytes_for("survey")
+        return sum(
+            item.length
+            for item in self.ranges
+            if item.status == "skipped"
+            and item.cause in ("survey", "probe")
+            and item.difficulty in (None, "fast")
+        )
+
+    @property
+    def slow_skipped_bytes(self) -> int:
+        return sum(
+            item.length
+            for item in self.ranges
+            if item.status == "skipped"
+            and (
+                item.difficulty == "slow"
+                or (item.difficulty is None and item.cause == "slow")
+            )
+        )
 
     @property
     def hard_skipped_bytes(self) -> int:
-        return self.skipped_bytes - self.easy_skipped_bytes
+        return sum(
+            item.length
+            for item in self.ranges
+            if item.status == "skipped"
+            and (
+                item.difficulty == "hard"
+                or (item.difficulty is None and item.cause == "hard")
+            )
+        )
+
+    @property
+    def failure_skipped_bytes(self) -> int:
+        return sum(
+            item.length
+            for item in self.ranges
+            if item.status == "skipped"
+            and (
+                item.difficulty == "failure"
+                or (item.difficulty is None and item.cause == "read_error")
+            )
+        )
 
     @property
     def unreadable_bytes(self) -> int:
@@ -229,7 +307,15 @@ class RescueMap:
         return sum(
             item.length
             for item in self.ranges
-            if item.status == "recovered" and item.cause == "slow"
+            if item.status == "recovered" and item.difficulty == "slow"
+        )
+
+    @property
+    def hard_bytes(self) -> int:
+        return sum(
+            item.length
+            for item in self.ranges
+            if item.status == "recovered" and item.difficulty == "hard"
         )
 
     @property
@@ -264,6 +350,57 @@ class RescueMap:
         return value
 
 
+def mark_map_range(
+    state: RescueMap,
+    offset: int,
+    length: int,
+    classification: ManualClassification,
+) -> int:
+    """Change only unresolved map ranges, never already recovered bytes."""
+
+    if classification not in ("slow", "hard", "defer", "clear"):
+        raise ValueError("classification must be slow, hard, defer, or clear")
+    if not _is_int(offset) or not _is_int(length):
+        raise TypeError("range offset and length must be integers")
+    if offset < 0 or length <= 0 or offset + length > state.source_size:
+        raise ValueError("marked range is outside the source")
+
+    end = offset + length
+    changed = 0
+    for item in tuple(state.ranges):
+        overlap_start = max(offset, item.offset)
+        overlap_end = min(end, item.end)
+        if overlap_end <= overlap_start or item.status == "recovered":
+            continue
+        overlap_length = overlap_end - overlap_start
+        if classification == "clear":
+            if not (item.cause or "").startswith("manual_"):
+                continue
+            state.replace_range(overlap_start, overlap_length, "unprocessed")
+        else:
+            difficulty: RangeDifficulty = (
+                "slow" if classification == "slow" else "hard"
+            )
+            state.replace_range(
+                overlap_start,
+                overlap_length,
+                "skipped",
+                f"manual_{classification}",
+                difficulty,
+            )
+        changed += overlap_length
+
+    if changed:
+        target_pass = {"clear": 1, "slow": 3, "hard": 4, "defer": 5}[
+            classification
+        ]
+        state.current_pass = min(state.current_pass, target_pass)
+        state.pass_cursor = 0
+        state.adaptive_skip = 0
+        state.validate()
+    return changed
+
+
 def _range_from_json(value: object, index: int) -> RecoveryRange:
     if not isinstance(value, dict):
         raise MapValidationError(f"ranges[{index}] must be an object")
@@ -277,7 +414,22 @@ def _range_from_json(value: object, index: int) -> RecoveryRange:
     cause = value.get("cause")
     if cause is not None and not isinstance(cause, str):
         raise MapValidationError(f"ranges[{index}].cause must be a string or null")
-    return RecoveryRange(offset, length, status, cause)  # type: ignore[arg-type]
+    difficulty = value.get("difficulty")
+    if difficulty is not None and (
+        not isinstance(difficulty, str) or difficulty not in RANGE_DIFFICULTIES
+    ):
+        raise MapValidationError(f"ranges[{index}].difficulty is invalid")
+    return RecoveryRange(offset, length, status, cause, difficulty)  # type: ignore[arg-type]
+
+
+def _legacy_difficulty(item: RecoveryRange) -> RangeDifficulty | None:
+    if item.status == "unreadable" or item.cause == "read_error":
+        return "failure"
+    if item.cause == "slow":
+        return "slow"
+    if item.cause == "hard":
+        return "hard"
+    return None
 
 
 def _v1_bad_range(value: object, index: int) -> tuple[int, int]:
@@ -312,7 +464,9 @@ def _migrate_v1(value: dict[object, object]) -> RescueMap:
             raise MapValidationError("v1 bad ranges overlap or exceed completed_until")
         if offset > cursor:
             ranges.append(RecoveryRange(cursor, offset - cursor, "recovered"))
-        ranges.append(RecoveryRange(offset, length, "unreadable", "read_error"))
+        ranges.append(
+            RecoveryRange(offset, length, "unreadable", "read_error", "failure")
+        )
         cursor = end
     if cursor < completed_until:
         ranges.append(RecoveryRange(cursor, completed_until - cursor, "recovered"))
@@ -341,6 +495,55 @@ def _policy_from_json(value: object) -> RecoveryPolicy | None:
         raise MapValidationError(f"invalid recovery policy: {exc}") from exc
 
 
+def _migrate_v2(value: dict[object, object]) -> RescueMap:
+    """Move the old four-pass cursor into the five-pass state machine.
+
+    Old Pass 4 was Deep.  A zero cursor means it had not started, so the new
+    Hard pass can run next; a non-zero cursor means Deep was interrupted and is
+    resumed as new Pass 5.  Old terminal state 5 becomes terminal state 6.
+    Range classifications and recovered bytes are preserved verbatim; a v1
+    policy is upgraded by ``RecoveryPolicy.from_dict``.
+    """
+
+    raw_ranges = value.get("ranges")
+    if not isinstance(raw_ranges, list):
+        raise MapValidationError("ranges must be an array")
+    old_pass = value.get("current_pass")
+    if not _is_int(old_pass) or not 1 <= old_pass <= 5:
+        raise MapValidationError("current_pass must be between 1 and 5")
+    pass_cursor = _require_nonnegative_int(value.get("pass_cursor"), "pass_cursor")
+    if old_pass <= 3:
+        current_pass = old_pass
+    elif old_pass == 4:
+        current_pass = 4 if pass_cursor == 0 else 5
+    else:
+        current_pass = 6
+    state = RescueMap(
+        source_path=value.get("source_path"),  # type: ignore[arg-type]
+        source_size=_require_nonnegative_int(value.get("source_size"), "source_size"),
+        destination_path=value.get("destination_path"),  # type: ignore[arg-type]
+        ranges=[
+            RecoveryRange(
+                parsed.offset,
+                parsed.length,
+                parsed.status,
+                parsed.cause,
+                _legacy_difficulty(parsed),
+            )
+            for index, item in enumerate(raw_ranges)
+            for parsed in (_range_from_json(item, index),)
+        ],
+        current_pass=current_pass,
+        pass_cursor=pass_cursor,
+        adaptive_skip=_require_nonnegative_int(
+            value.get("adaptive_skip", 0), "adaptive_skip"
+        ),
+        policy=_policy_from_json(value.get("policy")),
+    )
+    state.validate()
+    return state
+
+
 def map_from_dict(value: object) -> RescueMap:
     if not isinstance(value, dict):
         raise MapValidationError("map root must be an object")
@@ -349,10 +552,13 @@ def map_from_dict(value: object) -> RescueMap:
         raise MapValidationError("version must be an integer")
     if version == 1:
         return _migrate_v1(value)
+    if version == 2:
+        return _migrate_v2(value)
     if version != MAP_VERSION:
         raise MapValidationError(
-            f"unsupported map version {version!r}; expected 1 or {MAP_VERSION}"
+            f"unsupported map version {version!r}; expected 1, 2, or {MAP_VERSION}"
         )
+
     raw_ranges = value.get("ranges")
     if not isinstance(raw_ranges, list):
         raise MapValidationError("ranges must be an array")
